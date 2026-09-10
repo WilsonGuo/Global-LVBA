@@ -3,9 +3,9 @@
   <img src="pics/3DGS.png" width="60%" alt="接入3DGS流程">
 </div>
 
-可以搭配Global-LVBA
+可以搭配FAST-LIVO2-RTK
 
- See [Global-LVBA](https://github.com/WilsonGuo/Global-LVBA).
+ See [FAST-LIVO2-RTK](https://github.com/WilsonGuo/FAST-LIVO2-RTK).
 
 
 
