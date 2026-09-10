@@ -1,0 +1,94 @@
+cam_model:
+  cam_width: 720
+  cam_height: 540
+  scale: 1.0
+
+  cam_fx: 906.374156
+  cam_fy: 904.016779
+  cam_cx: 376.177026
+  cam_cy: 291.780049
+
+  cam_d0: -0.044706
+  cam_d1: 0.008157
+  cam_d2: 0.000200
+  cam_d3: -0.000896
+
+
+extrin_calib:
+  extrinsic_T: [0.04165, 0.02326, -0.0284]
+  extrinsic_R: [1, 0, 0,
+                0, 1, 0,
+                0, 0, 1]
+
+  # LiDAR -> Camera
+  Rcl: [
+    -0.01296, -0.99992, -0.00005,
+    -0.01359,  0.00023, -0.99991,
+     0.99982, -0.01296, -0.01359
+  ]
+
+  Pcl: [0.07404, -0.00242, 0.09286]
+
+
+data_config:
+  data_path: "../FAST-LIVO2-RTK/Log/GlobalLVBA/avia_test01/"
+  colmap_db_path: "Colmap/colmap_sub5.db"
+
+  image_sample_step: 5
+
+  enable_lidar_ba: true
+  enable_visual_ba: true
+
+  visual_pair_max_gap: 5
+
+
+window_ba:
+  enable: true
+  size: 20
+  anchor_leaf_size: 0.01
+  use_window_ba_rel: true
+
+
+BALM_stage1:
+  enable: true
+  root_voxel_size: 1.0
+  eigen_ratio_array: [0.2, 0.2, 0.2, 0.2]
+
+
+BALM_stage2:
+  root_voxel_size: 0.5
+  eigen_ratio_array: [0.08, 0.08, 0.08, 0.08]
+
+
+track_fusion:
+  min_view_angle: 8.0
+  reproj_mean_thr: 3.0
+
+  depth_only: false
+  log_dropped_tracks: false
+
+  tri_min_angle_deg: 8.0
+  tri_max_reproj_px: 3.0
+  tri_max_depth_m: 50.0
+
+
+visual_ba:
+  pose_prior_sigma_trans: 0.03
+  pose_prior_sigma_rot_deg: 1.0
+
+  pose_guard_max_trans: 0.15
+  pose_guard_max_rot_deg: 5.0
+
+  plane_search_radius_vox: 1
+  plane_max_dist: 0.08
+
+
+colmap_output:
+  enable: false
+  filter_size_points3D: 0.01
+
+gs_export:
+  enable: true
+  output_dir: "3DGS_V6"
+  point_leaf_size: 0.01
+  save_colored_pcd: true

@@ -1,0 +1,2920 @@
+#include "lvba_system.h"
+#include <algorithm>
+#include <cstdint>
+#include <chrono>
+#include <limits>
+#include <unordered_set>
+
+namespace lvba {
+
+// Camera pose prior used by Visual BA.
+// q is Ceres/Eigen quaternion storage order [w, x, y, z].
+// The prior keeps visual BA close to the LiDAR-BA initialized camera poses.
+struct CameraPosePriorError {
+    CameraPosePriorError(const Eigen::Quaterniond& q_ref,
+                         const Eigen::Vector3d& t_ref,
+                         double sigma_rot_rad,
+                         double sigma_trans_m)
+        : qw_(q_ref.w()), qx_(q_ref.x()), qy_(q_ref.y()), qz_(q_ref.z()),
+          tx_(t_ref.x()), ty_(t_ref.y()), tz_(t_ref.z()),
+          inv_sigma_rot_(1.0 / std::max(1e-9, sigma_rot_rad)),
+          inv_sigma_trans_(1.0 / std::max(1e-9, sigma_trans_m)) {}
+
+    template <typename T>
+    bool operator()(const T* const q, const T* const t, T* residuals) const {
+        // q_rel = q_ref^{-1} * q. q_ref is constant and normalized.
+        const T rw = T(qw_);
+        const T rx = T(-qx_);
+        const T ry = T(-qy_);
+        const T rz = T(-qz_);
+
+        const T qw = rw*q[0] - rx*q[1] - ry*q[2] - rz*q[3];
+        const T qx = rw*q[1] + rx*q[0] + ry*q[3] - rz*q[2];
+        const T qy = rw*q[2] - rx*q[3] + ry*q[0] + rz*q[1];
+        const T qz = rw*q[3] + rx*q[2] - ry*q[1] + rz*q[0];
+        (void)qw;
+
+        // For the small corrections expected here, 2*q_rel.xyz is the rotation vector.
+        residuals[0] = T(2.0 * inv_sigma_rot_) * qx;
+        residuals[1] = T(2.0 * inv_sigma_rot_) * qy;
+        residuals[2] = T(2.0 * inv_sigma_rot_) * qz;
+
+        residuals[3] = T(inv_sigma_trans_) * (t[0] - T(tx_));
+        residuals[4] = T(inv_sigma_trans_) * (t[1] - T(ty_));
+        residuals[5] = T(inv_sigma_trans_) * (t[2] - T(tz_));
+        return true;
+    }
+
+    static ceres::CostFunction* Create(const Eigen::Quaterniond& q_ref,
+                                       const Eigen::Vector3d& t_ref,
+                                       double sigma_rot_rad,
+                                       double sigma_trans_m) {
+        return new ceres::AutoDiffCostFunction<CameraPosePriorError, 6, 4, 3>(
+            new CameraPosePriorError(q_ref, t_ref, sigma_rot_rad, sigma_trans_m));
+    }
+
+    double qw_, qx_, qy_, qz_;
+    double tx_, ty_, tz_;
+    double inv_sigma_rot_;
+    double inv_sigma_trans_;
+};
+
+static std::vector<std::pair<int,int>> SortedSelectedEntries(
+    const std::unordered_map<int,int>& selected_ids)
+{
+    std::vector<std::pair<int,int>> entries;
+    entries.reserve(selected_ids.size());
+    for (const auto& kv : selected_ids) entries.push_back(kv);
+    std::sort(entries.begin(), entries.end(),
+              [](const std::pair<int,int>& a, const std::pair<int,int>& b) {
+                  if (a.first != b.first) return a.first < b.first;
+                  return a.second < b.second;
+              });
+    return entries;
+}
+
+static bool ComputeMeanReproj(
+    const Eigen::Vector3d& Xw,
+    const std::unordered_map<int,int>& selected_ids,
+    const std::vector<std::pair<int,int>>& component,
+    const std::vector<std::vector<sift::Keypoint>>& all_keypoints,
+    const std::vector<Eigen::Matrix3d>& Rcw_all_optimized,
+    const std::vector<Eigen::Vector3d>& tcw_all_optimized,
+    const CameraIntrinsics& cam,
+    int min_count,
+    double& mean_reproj,
+    int& cnt_err)
+{
+    double sum_err = 0.0;
+    cnt_err = 0;
+    const auto selected_entries = SortedSelectedEntries(selected_ids);
+    for (const auto& kv : selected_entries) {
+        const int comp_idx = kv.second;
+        if (comp_idx < 0 || comp_idx >= static_cast<int>(component.size())) continue;
+
+        const int img_id = component[comp_idx].first;
+        const int kp_id  = component[comp_idx].second;
+
+        if (img_id < 0 || img_id >= static_cast<int>(Rcw_all_optimized.size()) ||
+            img_id >= static_cast<int>(tcw_all_optimized.size())) continue;
+        if (img_id < 0 || img_id >= static_cast<int>(all_keypoints.size()) ||
+            kp_id < 0 || kp_id >= static_cast<int>(all_keypoints[img_id].size())) continue;
+
+        const double u_obs = all_keypoints[img_id][kp_id].x;
+        const double v_obs = all_keypoints[img_id][kp_id].y;
+
+        double u_hat = 0.0, v_hat = 0.0;
+        if (!projectWorldToPixel(cam, Rcw_all_optimized[img_id], tcw_all_optimized[img_id],
+                                 Xw, &u_hat, &v_hat)) continue;
+
+        const double du = u_hat - u_obs;
+        const double dv = v_hat - v_obs;
+        sum_err += std::sqrt(du * du + dv * dv);
+        ++cnt_err;
+    }
+
+    if (cnt_err < min_count) return false;
+    mean_reproj = sum_err / static_cast<double>(cnt_err);
+    return std::isfinite(mean_reproj);
+}
+
+static bool TriangulateTrackDLT(
+    const std::unordered_map<int,int>& selected_ids,
+    const std::vector<std::pair<int,int>>& component,
+    const std::vector<std::vector<sift::Keypoint>>& all_keypoints,
+    const std::vector<Eigen::Matrix3d>& Rcw_all_optimized,
+    const std::vector<Eigen::Vector3d>& tcw_all_optimized,
+    const CameraIntrinsics& cam,
+    Eigen::Vector3d& Xw_tri,
+    double& mean_reproj_tri,
+    int& cnt_reproj_tri)
+{
+    if (selected_ids.size() < 4) return false;
+
+    Eigen::Matrix4d AtA = Eigen::Matrix4d::Zero();
+    int equation_rows = 0;
+
+    const auto selected_entries = SortedSelectedEntries(selected_ids);
+    for (const auto& kv : selected_entries) {
+        const int comp_idx = kv.second;
+        if (comp_idx < 0 || comp_idx >= static_cast<int>(component.size())) continue;
+
+        const int img_id = component[comp_idx].first;
+        const int kp_id  = component[comp_idx].second;
+        if (img_id < 0 || img_id >= static_cast<int>(Rcw_all_optimized.size()) ||
+            img_id >= static_cast<int>(tcw_all_optimized.size())) continue;
+        if (img_id < 0 || img_id >= static_cast<int>(all_keypoints.size()) ||
+            kp_id < 0 || kp_id >= static_cast<int>(all_keypoints[img_id].size())) continue;
+
+        const double u = all_keypoints[img_id][kp_id].x;
+        const double v = all_keypoints[img_id][kp_id].y;
+        double x = 0.0, y = 0.0;
+        if (!undistortPixelToNormalized(cam, u, v, &x, &y)) continue;
+        const Eigen::Matrix3d& Rcw = Rcw_all_optimized[img_id];
+        const Eigen::Vector3d& tcw = tcw_all_optimized[img_id];
+
+        Eigen::Matrix<double, 3, 4> P;
+        P.block<3, 3>(0, 0) = Rcw;
+        P.block<3, 1>(0, 3) = tcw;
+
+        const Eigen::Vector4d row_u = x * P.row(2).transpose() - P.row(0).transpose();
+        const Eigen::Vector4d row_v = y * P.row(2).transpose() - P.row(1).transpose();
+        AtA += row_u * row_u.transpose();
+        AtA += row_v * row_v.transpose();
+        equation_rows += 2;
+    }
+
+    if (equation_rows < 8) return false;
+
+    Eigen::SelfAdjointEigenSolver<Eigen::Matrix4d> solver(AtA);
+    if (solver.info() != Eigen::Success) return false;
+
+    const Eigen::Vector4d Xh = solver.eigenvectors().col(0);
+    if (std::abs(Xh.w()) < 1e-12) return false;
+
+    Xw_tri = Xh.head<3>() / Xh.w();
+    if (!Xw_tri.allFinite()) return false;
+
+    return ComputeMeanReproj(
+        Xw_tri, selected_ids, component, all_keypoints, Rcw_all_optimized,
+        tcw_all_optimized, cam, 4, mean_reproj_tri, cnt_reproj_tri);
+}
+
+
+struct TriGeometryCheck {
+    bool positive_depth_ok = false;
+    bool depth_range_ok = false;
+    bool angle_ok = false;
+    bool reproj_ok = false;
+    double max_view_angle_deg = 0.0;
+    double mean_reproj_px = std::numeric_limits<double>::infinity();
+    double max_reproj_px = std::numeric_limits<double>::infinity();
+    double min_depth_m = std::numeric_limits<double>::infinity();
+    double max_depth_m = 0.0;
+};
+
+static TriGeometryCheck EvaluateTriangulationGeometry(
+    const Eigen::Vector3d& Xw,
+    const std::unordered_map<int,int>& selected_ids,
+    const std::vector<std::pair<int,int>>& component,
+    const std::vector<std::vector<sift::Keypoint>>& all_keypoints,
+    const std::vector<Eigen::Matrix3d>& Rcw_all_optimized,
+    const std::vector<Eigen::Vector3d>& tcw_all_optimized,
+    const CameraIntrinsics& cam,
+    double min_angle_deg,
+    double max_reproj_px_thr,
+    double max_depth_m_thr)
+{
+    TriGeometryCheck r;
+    if (!Xw.allFinite() || selected_ids.size() < 4) return r;
+
+    std::vector<Eigen::Vector3d> rays;
+    rays.reserve(selected_ids.size());
+
+    double sum_reproj = 0.0;
+    double max_reproj = 0.0;
+    int valid_obs = 0;
+    bool all_positive = true;
+    bool all_in_range = true;
+
+    const auto selected_entries = SortedSelectedEntries(selected_ids);
+    for (const auto& kv : selected_entries) {
+        const int comp_idx = kv.second;
+        if (comp_idx < 0 || comp_idx >= static_cast<int>(component.size())) {
+            all_positive = false; all_in_range = false; continue;
+        }
+
+        const int img_id = component[comp_idx].first;
+        const int kp_id  = component[comp_idx].second;
+        if (img_id < 0 || img_id >= static_cast<int>(Rcw_all_optimized.size()) ||
+            img_id >= static_cast<int>(tcw_all_optimized.size()) ||
+            img_id >= static_cast<int>(all_keypoints.size()) ||
+            kp_id < 0 || kp_id >= static_cast<int>(all_keypoints[img_id].size())) {
+            all_positive = false; all_in_range = false; continue;
+        }
+
+        const Eigen::Matrix3d& Rcw = Rcw_all_optimized[img_id];
+        const Eigen::Vector3d& tcw = tcw_all_optimized[img_id];
+        const Eigen::Vector3d Xc = Rcw * Xw + tcw;
+        const double z = Xc.z();
+        if (!std::isfinite(z) || z <= 1e-3) {
+            all_positive = false;
+            continue;
+        }
+        r.min_depth_m = std::min(r.min_depth_m, z);
+        r.max_depth_m = std::max(r.max_depth_m, z);
+        if (z > max_depth_m_thr) all_in_range = false;
+
+        const Eigen::Vector3d Cw = -Rcw.transpose() * tcw;
+        Eigen::Vector3d ray = Xw - Cw;
+        const double ray_norm = ray.norm();
+        if (!std::isfinite(ray_norm) || ray_norm < 1e-6) {
+            all_positive = false;
+            continue;
+        }
+        rays.push_back(ray / ray_norm);
+
+        double u_hat = 0.0, v_hat = 0.0;
+        if (!projectWorldToPixel(cam, Rcw, tcw, Xw, &u_hat, &v_hat)) {
+            all_positive = false;
+            continue;
+        }
+        const double u_obs = all_keypoints[img_id][kp_id].x;
+        const double v_obs = all_keypoints[img_id][kp_id].y;
+        const double du = u_hat - u_obs;
+        const double dv = v_hat - v_obs;
+        const double e = std::sqrt(du * du + dv * dv);
+        if (!std::isfinite(e)) {
+            all_positive = false;
+            continue;
+        }
+        sum_reproj += e;
+        max_reproj = std::max(max_reproj, e);
+        ++valid_obs;
+    }
+
+    r.positive_depth_ok = all_positive && (valid_obs == static_cast<int>(selected_ids.size()));
+    r.depth_range_ok = r.positive_depth_ok && all_in_range;
+
+    double max_angle_rad = 0.0;
+    for (size_t a = 0; a < rays.size(); ++a) {
+        for (size_t b = a + 1; b < rays.size(); ++b) {
+            double c = rays[a].dot(rays[b]);
+            c = std::max(-1.0, std::min(1.0, c));
+            max_angle_rad = std::max(max_angle_rad, std::acos(c));
+        }
+    }
+    r.max_view_angle_deg = max_angle_rad * 180.0 / M_PI;
+    r.angle_ok = r.depth_range_ok && (r.max_view_angle_deg >= min_angle_deg);
+
+    if (valid_obs > 0) {
+        r.mean_reproj_px = sum_reproj / static_cast<double>(valid_obs);
+        r.max_reproj_px = max_reproj;
+    }
+    r.reproj_ok = r.angle_ok && std::isfinite(r.mean_reproj_px) &&
+                  std::isfinite(r.max_reproj_px) &&
+                  (r.max_reproj_px <= max_reproj_px_thr);
+    return r;
+}
+
+LvbaSystem::LvbaSystem(ros::NodeHandle& nh) : nh_(nh)                                
+{
+    dataset_io_.reset(new DatasetIO(nh_));
+
+    cloud_pub_after_ = nh_.advertise<sensor_msgs::PointCloud2>("/lvba/cloud_after", 1, true);
+    cloud_pub_before_ = nh_.advertise<sensor_msgs::PointCloud2>("/lvba/cloud_before", 1, true);
+    pub_test_ = nh_.advertise<sensor_msgs::PointCloud2>("/map_test", 100);
+    pub_path_ = nh_.advertise<sensor_msgs::PointCloud2>("/map_path", 100);
+    pub_show_ = nh_.advertise<sensor_msgs::PointCloud2>("/map_show", 100);
+    pub_cute_ = nh_.advertise<sensor_msgs::PointCloud2>("/map_cute", 100);
+
+    pub_cloud_before_ = nh_.advertise<sensor_msgs::PointCloud2>("viz/cloud_before", 1, true);
+    pub_cloud_after_  = nh_.advertise<sensor_msgs::PointCloud2>("viz/cloud_after", 1, true);
+
+    nh_.param<bool>("data_config/enable_lidar_ba", enable_lidar_ba_, true);
+    nh_.param<bool>("data_config/enable_visual_ba", enable_visual_ba_, true);
+    nh_.param<double>("track_fusion/min_view_angle", min_view_angle_deg_, 8.0);
+    nh_.param<double>("track_fusion/reproj_mean_thr", reproj_mean_thr_px_, 3.0);
+
+    nh_.param<bool>("colmap_output/enable", colmap_output_enable_, true);
+    nh_.param<double>("colmap_output/filter_size_points3D", filter_size_points3D_, 0.01);
+}
+
+void LvbaSystem::runFullPipeline() 
+{
+    initFromDatasetIO();
+    if(enable_lidar_ba_) runLidarBA();
+    if(enable_visual_ba_) runVisualBAWithLidarAssist();
+    ros::spin();
+}
+
+void LvbaSystem::runVisualBAWithLidarAssist()
+{
+    buildGridMapFromOptimized();
+    updateCameraPosesFromLidar();
+    generateDepthWithVoxel();
+    extractAndMatchFeaturesGPU();
+    BuildTracksAndFuse3D();
+    optimizeCameraPoses();
+    visualizeProj();
+    pubRGBCloud();
+}
+
+template <typename T>
+void LvbaSystem::pub_pl_func(T &pl, ros::Publisher &pub)
+{
+  pl.height = 1; pl.width = pl.size();
+  sensor_msgs::PointCloud2 output;
+  pcl::toROSMsg(pl, output);
+  output.header.frame_id = "map";
+  output.header.stamp = ros::Time::now();
+  pub.publish(output);
+}
+
+void LvbaSystem::data_show(vector<IMUST> x_buf, vector<pcl::PointCloud<PointType>::Ptr> &pl_fulls)
+{
+  IMUST es0 = x_buf[0];
+  for(uint i=0; i<x_buf.size(); i++)
+  {
+    x_buf[i].p = es0.R.transpose() * (x_buf[i].p - es0.p);
+    x_buf[i].R = es0.R.transpose() * x_buf[i].R;
+  }
+
+  pcl::PointCloud<PointType> pl_send, pl_path;
+  int winsize = x_buf.size();
+  for(int i=0; i<winsize; i++)
+  {
+    pcl::PointCloud<PointType> pl_tem = *pl_fulls[i];
+    down_sampling_voxel(pl_tem, 0.05);
+    pl_transform(pl_tem, x_buf[i]);
+    pl_send += pl_tem;
+
+    // if((i%2==0 && i!=0) || i == winsize-1)
+    // {
+    //   pub_pl_func(pl_send, pub_show_);
+    //   pl_send.clear();
+    //   sleep(0.3);
+    // }
+
+    PointType ap;
+    ap.x = x_buf[i].p.x();
+    ap.y = x_buf[i].p.y();
+    ap.z = x_buf[i].p.z();
+    ap.curvature = i;
+    pl_path.push_back(ap);
+  }
+  down_sampling_voxel(pl_send, 0.05);
+  pub_pl_func(pl_send, pub_show_);
+  pub_pl_func(pl_path, pub_path_);
+}
+
+void LvbaSystem::runWindowBA(const std::vector<IMUST>& x_buf_full,
+                             const std::vector<pcl::PointCloud<PointType>::Ptr>& pl_fulls_full,
+                             std::vector<IMUST>& anchor_poses,
+                             std::vector<pcl::PointCloud<PointType>::Ptr>& anchor_clouds)
+{
+    anchor_poses.clear();
+    anchor_clouds.clear();
+
+    const bool run_window = dataset_io_->window_ba_enable_;
+    const int window_size = dataset_io_->window_ba_size_;
+    const double anchor_leaf = dataset_io_->anchor_leaf_size_;
+    const bool use_window_ba_rel = dataset_io_->use_window_ba_rel_;
+    const int total_size = static_cast<int>(x_buf_full.size());
+
+    if (!run_window) {
+        anchor_poses = x_buf_full;
+        anchor_clouds = pl_fulls_full;
+        for (int i = 0; i < total_size; ++i) {
+            anchor_index_per_frame_[i] = i;
+            rel_poses_to_anchor_[i].setZero(); // identity
+        }
+        return;
+    }
+
+    printf("[WindowBA] Running Window LiDAR BA, window size=%d, anchor leaf=%.2f ...\n", window_size, anchor_leaf);
+
+    int win_total = 0;
+    int win_skipped = 0;
+    for (int start = 0; start < total_size; start += window_size) {
+        int end = std::min(start + window_size, total_size);
+        printProgressBar(end, total_size);
+
+        int curr_win = end - start;
+        if (curr_win <= 0) break;
+        ++win_total;
+
+        std::vector<IMUST> x_win(x_buf_full.begin() + start, x_buf_full.begin() + end);
+        std::vector<IMUST> x_win_odom = x_win;
+        std::vector<IMUST> x_win_aligned = x_win;
+        std::vector<pcl::PointCloud<PointType>::Ptr> pl_win;
+        pl_win.reserve(curr_win);
+        for (int i = start; i < end; ++i) pl_win.push_back(pl_fulls_full[i]);
+
+        std::unordered_map<VOXEL_LOC, OCTO_TREE_ROOT*> surf_map;
+        for (int j = 0; j < curr_win; ++j) {
+            cut_voxel(surf_map, *pl_win[j], x_win[j], j, curr_win,
+                      dataset_io_->stage1_root_voxel_size_, dataset_io_->stage1_eigen_ratio_array_[0]);
+        }
+
+        std::unique_ptr<BALM2> opt_lsv(new BALM2(curr_win));
+        std::unique_ptr<VOX_HESS> voxhess(new VOX_HESS(curr_win));
+        for (auto iter = surf_map.begin(); iter != surf_map.end() && nh_.ok(); ++iter) {
+            iter->second->recut(x_win);
+            iter->second->tras_opt(*voxhess);
+        }
+        if (voxhess->plvec_voxels.size() < static_cast<size_t>(3 * x_win.size())) {
+            for (auto& kv : surf_map) delete kv.second;
+            ++win_skipped;
+            continue;
+        }
+        opt_lsv->damping_iter(x_win, *voxhess);
+
+        for (auto& kv : surf_map) delete kv.second;
+
+        if (use_window_ba_rel && !x_win.empty()) {
+            const IMUST& odom0 = x_win_odom[0];
+            const IMUST& opt0  = x_win[0];
+            Eigen::Matrix3d R_align = odom0.R * opt0.R.transpose();
+            Eigen::Vector3d p_align = odom0.p - R_align * opt0.p;
+            for (int j = 0; j < curr_win; ++j) {
+                x_win_aligned[j].R = R_align * x_win[j].R;
+                x_win_aligned[j].p = R_align * x_win[j].p + p_align;
+            }
+        } else {
+            x_win_aligned = x_win_odom;
+        }
+
+        pcl::PointCloud<PointType>::Ptr merged(new pcl::PointCloud<PointType>());
+        const IMUST anchor_pose = x_win_odom[0];
+        const int anchor_idx = static_cast<int>(anchor_poses.size());
+        for (int j = 0; j < curr_win; ++j) {
+            pcl::PointCloud<PointType> tmp = *pl_win[j];
+            IMUST rel;
+            rel.R = anchor_pose.R.transpose() * x_win_aligned[j].R;
+            rel.p = anchor_pose.R.transpose() * (x_win_aligned[j].p - anchor_pose.p);
+            pl_transform(tmp, rel);
+            *merged += tmp;
+
+            const int global_idx = start + j;
+            if (global_idx < total_size) {
+                rel_poses_to_anchor_[global_idx] = rel;
+                anchor_index_per_frame_[global_idx] = anchor_idx;
+            }
+        }
+        down_sampling_voxel2(*merged, anchor_leaf);
+
+        anchor_poses.push_back(anchor_pose);
+        anchor_clouds.push_back(merged);
+    }
+    std::cout << std::endl;
+
+    if (win_total > 0) {
+        printf("[WindowBA] skipped %d/%d windows (%.2f%%)\n",
+               win_skipped, win_total,
+               100.0 * static_cast<double>(win_skipped) / static_cast<double>(win_total));
+    }
+}
+
+void LvbaSystem::runLidarBA() 
+{
+    std::vector<IMUST> x_buf_full = dataset_io_->x_buf_;
+    std::vector<pcl::PointCloud<PointType>::Ptr> pl_fulls_full = dataset_io_->pl_fulls_;
+    const int total_size = static_cast<int>(x_buf_full.size());
+    if (total_size == 0) {
+        ROS_WARN("No poses in buffer, skip runLidarBA.");
+        return;
+    }
+
+    data_show(x_buf_full, pl_fulls_full);
+    printf("If no problem, input '1' to continue or '0' to exit...\n");
+    int cont_flag = 1;
+    std::cin >> cont_flag;
+    if (cont_flag == 0) {
+        return;
+    }
+    std::vector<IMUST> anchor_poses;
+    std::vector<pcl::PointCloud<PointType>::Ptr> anchor_clouds;
+
+    rel_poses_to_anchor_.assign(total_size, IMUST());
+    anchor_index_per_frame_.assign(total_size, -1); //用来表示每一原始针对应的锚点帧的下标
+
+    runWindowBA(x_buf_full, pl_fulls_full, anchor_poses, anchor_clouds);
+
+    const int win_size = static_cast<int>(anchor_poses.size());
+    const char* pass_name[2] = {"Stage 1", "Stage 2"};
+    bool run_stage1 = dataset_io_->stage1_enable_;
+
+    double root_voxel_size[2];
+    std::array<float, 4> eigen_ratio_array[2];
+
+    root_voxel_size[0] = dataset_io_->stage1_root_voxel_size_;
+    root_voxel_size[1] = dataset_io_->stage2_root_voxel_size_;
+    eigen_ratio_array[0].fill(0.f);
+    eigen_ratio_array[1].fill(0.f);
+
+    for (size_t i = 0; i < eigen_ratio_array[0].size(); ++i) {
+        if (i < dataset_io_->stage1_eigen_ratio_array_.size())
+            eigen_ratio_array[0][i] = dataset_io_->stage1_eigen_ratio_array_[i];
+        if (i < dataset_io_->stage2_eigen_ratio_array_.size())
+            eigen_ratio_array[1][i] = dataset_io_->stage2_eigen_ratio_array_[i];
+    }
+
+    int start_idx = run_stage1 ? 0 : 1;
+    for (int idx = start_idx; idx < 2; ++idx) {
+        cout << "[runLidarBA] Global LiDAR BA start... " << pass_name[idx] << endl;
+
+        set_eigen_ratio_array(eigen_ratio_array[idx]);
+        std::unordered_map<VOXEL_LOC, OCTO_TREE_ROOT*> surf_map;
+        pcl::PointCloud<PointType> pl_send;
+        pub_pl_func(pl_send, pub_show_);
+
+        float eigen_ratio_val = eigen_ratio_array[idx][0];
+        for (int j = 0; j < win_size; j++) {
+            cut_voxel(surf_map, *anchor_clouds[j], anchor_poses[j], j, win_size,
+                      root_voxel_size[idx], eigen_ratio_val);
+        }
+
+        std::unique_ptr<BALM2> opt_lsv(new BALM2(win_size));
+        std::unique_ptr<VOX_HESS> voxhess(new VOX_HESS(win_size));
+
+        for (auto iter = surf_map.begin(); iter != surf_map.end() && nh_.ok(); ++iter) {
+            iter->second->recut(anchor_poses);
+            iter->second->tras_opt(*voxhess);
+            iter->second->tras_display(pl_send, anchor_poses, 0);
+        }
+
+        down_sampling_voxel(pl_send, 0.05);
+        pub_pl_func(pl_send, pub_cute_);
+
+        pl_send.clear();
+        pub_pl_func(pl_send, pub_cute_);
+
+        opt_lsv->damping_iter(anchor_poses, *voxhess);
+
+        for (auto& kv : surf_map) delete kv.second;
+    }
+
+    cout << "[runLidarBA] Global BALM Finish..." << endl;
+
+    optimized_x_buf_ = x_buf_full;
+    for (size_t idx = 0; idx < optimized_x_buf_.size(); ++idx) {
+        const int anchor_idx = (idx < anchor_index_per_frame_.size()) ? anchor_index_per_frame_[idx] : -1;
+        if (anchor_idx < 0 || anchor_idx >= static_cast<int>(anchor_poses.size())) continue;
+
+        const IMUST& rel = rel_poses_to_anchor_[idx];
+        const IMUST& anchor = anchor_poses[anchor_idx];
+
+        IMUST& out = optimized_x_buf_[idx];
+        out.R = anchor.R * rel.R;
+        out.p = anchor.R * rel.p + anchor.p;
+    }
+
+    dataset_io_->x_buf_ = optimized_x_buf_;
+    
+    // data_show(anchor_poses, anchor_clouds);
+    data_show(dataset_io_->x_buf_, dataset_io_->pl_fulls_);
+}
+
+void LvbaSystem::updateCameraPosesFromLidar()
+{
+    const auto& lidar_opt = dataset_io_->x_buf_;
+    const auto& lidar_orig = dataset_io_->x_buf_before_;
+    const auto& cam_orig = dataset_io_->image_poses_;
+
+    poses_.clear();
+    poses_.reserve(cam_orig.size());
+
+    std::vector<double> ts;
+    ts.reserve(lidar_opt.size());
+    for (const auto& x : lidar_opt) ts.push_back(x.t);
+
+    for (size_t i = 0; i < images_ids_.size(); ++i) {
+        double t_img = images_ids_[i];
+
+        auto it = std::lower_bound(ts.begin(), ts.end(), t_img);
+        size_t idx = (it == ts.end()) ? ts.size() - 1 : static_cast<size_t>(it - ts.begin());
+        if (it != ts.begin() && it != ts.end()) {
+            size_t prev = idx - 1;
+            if (std::abs(ts[prev] - t_img) < std::abs(ts[idx] - t_img)) idx = prev;
+        }
+        if (idx >= lidar_opt.size() || idx >= lidar_orig.size()) {
+            poses_.push_back(cam_orig[i]);
+            continue;
+        }
+
+        Sophus::SE3 T_opt(lidar_opt[idx].R, lidar_opt[idx].p);
+        Sophus::SE3 T_orig(lidar_orig[idx].R, lidar_orig[idx].p);
+        Sophus::SE3 T_delta = T_opt * T_orig.inverse();
+
+        Sophus::SE3 T_cam_new = T_delta * cam_orig[i];
+        poses_.push_back(T_cam_new);
+    }
+}
+
+void LvbaSystem::initFromDatasetIO() {
+
+    dataset_path_  = dataset_io_->dataset_path_;
+    images_ids_    = dataset_io_->images_ids_;
+    poses_before_  = dataset_io_->image_poses_;
+    // poses_         = dataset_io_->image_poses_;
+    // cloud_         = dataset_io_->cloud_;
+    all_voxel_ids_ = dataset_io_->all_voxel_ids_;
+
+    if (images_ids_.size() != poses_before_.size()) {
+        std::cerr << "Error: Number of images and poses do not match!" << std::endl;
+        return;
+    }
+
+    // Visual frontend: only match a local temporal window instead of all-to-all pairs.
+    // This reduces long-baseline/repetitive-texture false matches that can contaminate
+    // connected components in BuildTracksAndFuse3D().
+    int visual_pair_max_gap = 5;
+    nh_.param<int>("data_config/visual_pair_max_gap", visual_pair_max_gap, 5);
+    if (visual_pair_max_gap < 1) visual_pair_max_gap = 1;
+
+    image_pairs_.clear();
+    const size_t max_pair_gap = static_cast<size_t>(visual_pair_max_gap);
+    for (size_t i = 0; i < images_ids_.size(); ++i) {
+        const size_t j_end = std::min(images_ids_.size(), i + max_pair_gap + 1);
+        for (size_t j = i + 1; j < j_end; ++j) {
+            image_pairs_.push_back(std::make_pair(images_ids_[i], images_ids_[j]));
+        }
+    }
+
+    std::cout << "[VisualFrontend] images=" << images_ids_.size()
+              << " image_pairs=" << image_pairs_.size()
+              << " max_pair_gap=" << visual_pair_max_gap << std::endl;
+
+    all_keypoints_.resize(images_ids_.size());
+    all_depths_.reserve(images_ids_.size());
+
+    image_width_  = dataset_io_->width_;
+    image_height_ = dataset_io_->height_;
+    scale_ = dataset_io_->resize_scale_;
+
+    fx_ = dataset_io_->fx_;
+    fy_ = dataset_io_->fy_;
+    cx_ = dataset_io_->cx_;
+    cy_ = dataset_io_->cy_;
+    d0_ = dataset_io_->k1_;
+    d1_ = dataset_io_->k2_;
+    d2_ = dataset_io_->p1_;
+    d3_ = dataset_io_->p2_; 
+
+    std::vector<double> t_lidar2cam = dataset_io_->cameraextrinT_;
+    std::vector<double> r_lidar2cam = dataset_io_->cameraextrinR_;
+
+    tcl_ << t_lidar2cam[0], t_lidar2cam[1], t_lidar2cam[2];
+    Rcl_ << r_lidar2cam[0], r_lidar2cam[1], r_lidar2cam[2],
+            r_lidar2cam[3], r_lidar2cam[4], r_lidar2cam[5],
+            r_lidar2cam[6], r_lidar2cam[7], r_lidar2cam[8];
+
+    std::vector<double> t_lidar2imu = dataset_io_->extrinT_;
+    std::vector<double> r_lidar2imu = dataset_io_->extrinR_;
+
+    Eigen::Vector3d til; Eigen::Matrix3d Ril;
+    til << t_lidar2imu[0], t_lidar2imu[1], t_lidar2imu[2];
+    Ril << r_lidar2imu[0], r_lidar2imu[1], r_lidar2imu[2],
+           r_lidar2imu[3], r_lidar2imu[4], r_lidar2imu[5],
+           r_lidar2imu[6], r_lidar2imu[7], r_lidar2imu[8];
+
+    Rli_ = Ril.transpose();
+    tli_ = -Rli_ * til;
+    Rci_ = Rcl_ * Rli_;
+    tci_ = Rcl_ * tli_ + tcl_;
+}
+
+
+// 不需要包含 <GL/gl.h>，避免 GL_LUMINANCE / GL_UNSIGNED_BYTE 冲突
+// 但要确保项目已链接 DevIL、GLEW/GLUT（SiftGPU 依赖）
+bool LvbaSystem::loadFromColmapDB()
+{
+    constexpr uint64_t kColmapMaxNumImages = (1ull << 31) - 1;
+    auto imageIdsToPairId = [kColmapMaxNumImages](uint32_t image_id1, uint32_t image_id2) -> uint64_t {
+        if (image_id1 > image_id2) {
+            std::swap(image_id1, image_id2);
+        }
+        return static_cast<uint64_t>(image_id1) * kColmapMaxNumImages +
+               static_cast<uint64_t>(image_id2);
+    };
+
+    sqlite3* db = nullptr;
+    if (sqlite3_open(dataset_io_->colmap_db_path_.c_str(), &db) != SQLITE_OK) {
+        std::cerr << "[DB] open failed: " << sqlite3_errmsg(db) << "\n";
+        return false;
+    }
+
+    // 1) 读取 images 表并将 image_id 和 file_name 对应起来
+    std::unordered_map<std::string, uint32_t> name2id;
+    size_t db_image_count = 0;
+    {
+        const char* sql = "SELECT image_id, name FROM images;";
+        sqlite3_stmt* stmt = nullptr;
+        if (sqlite3_prepare_v2(db, sql, -1, &stmt, nullptr) == SQLITE_OK) {
+            while (sqlite3_step(stmt) == SQLITE_ROW) {
+                uint32_t id = (uint32_t)sqlite3_column_int64(stmt, 0);
+                std::string name = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 1));
+                name2id[name] = id;
+                name2id[fs::path(name).filename().string()] = id;
+                ++db_image_count;
+            }
+        }
+        sqlite3_finalize(stmt);
+    }
+    std::cout << "[DB] ColmapDB images count = " << db_image_count << "\n";
+
+    if (db_image_count != images_ids_.size()) {
+        std::cerr << "[DB] Warning: DB images count (" << db_image_count
+                  << ") != dataset images count (" << images_ids_.size() << ")\n";
+        // 构建新的 数据库
+        std::cout << "[DB] Rebuilding COLMAP database...\n";
+        sqlite3_close(db);
+        return false;
+    }
+
+    ts2idx.clear();
+    ts2idx.reserve(images_ids_.size());
+    for (int i = 0; i < (int)images_ids_.size(); ++i) {
+        ts2idx[images_ids_[i]] = i;
+    }
+
+    // 辅助函数：根据时间戳查找对应的图像 ID
+    auto imageIdOfTs = [&](double ts)->int {
+        std::string p = getImagePath(ts);
+        std::string base = fs::path(p).filename().string();
+        auto it1 = name2id.find(base);
+        if (it1 != name2id.end()) return (int)it1->second;
+        return -1;
+    };
+
+    // 2) 读取 keypoints 表并写入 all_keypoints_
+    if ((int)all_keypoints_.size() < (int)images_ids_.size())
+        all_keypoints_.resize(images_ids_.size());
+
+    {
+        const char* sql = "SELECT rows, cols, data FROM keypoints WHERE image_id=?;";
+        sqlite3_stmt* stmt = nullptr;
+        if (sqlite3_prepare_v2(db, sql, -1, &stmt, nullptr) != SQLITE_OK) {
+            std::cerr << "[DB] keypoints SELECT prepare failed.\n";
+        } else {
+            for (size_t i = 0; i < images_ids_.size(); ++i) {
+                int image_id = imageIdOfTs(images_ids_[i]);
+                if (image_id < 0) continue;
+
+                sqlite3_reset(stmt);
+                sqlite3_bind_int(stmt, 1, image_id);
+                if (sqlite3_step(stmt) == SQLITE_ROW) {
+                    int rows = sqlite3_column_int(stmt, 0);
+                    int cols = sqlite3_column_int(stmt, 1);  // 4 或 6
+                    const void* blob = sqlite3_column_blob(stmt, 2);
+                    int blob_bytes = sqlite3_column_bytes(stmt, 2);
+
+                    if (blob && blob_bytes == rows * cols * (int)sizeof(float)) {
+                        const float* fp = reinterpret_cast<const float*>(blob);
+                        auto& vec = all_keypoints_[i];
+                        vec.resize(rows);
+                        for (int r = 0; r < rows; ++r) {
+                            sift::Keypoint kp{};
+                            kp.x = fp[r * cols + 0];
+                            kp.y = fp[r * cols + 1];
+                            if (cols >= 3) kp.sigma = fp[r * cols + 2];
+                            if (cols >= 4) kp.extremum_val = fp[r * cols + 3];
+                            vec[r] = kp;
+                        }
+                    }
+                }
+            }
+        }
+        sqlite3_finalize(stmt);
+    }
+
+    // 3) 读取 two_view_geometries 表并写入 all_matches_（只读取内点匹配）
+    all_matches_.assign(image_pairs_.size(), {});
+    {
+        const char* sql = "SELECT rows, cols, data FROM two_view_geometries WHERE pair_id=?;";
+        sqlite3_stmt* stmt = nullptr;
+        if (sqlite3_prepare_v2(db, sql, -1, &stmt, nullptr) != SQLITE_OK) {
+            std::cerr << "[DB] two_view_geometries SELECT prepare failed.\n";
+        } else {
+            for (size_t k = 0; k < image_pairs_.size(); ++k) {
+                const double ts1 = image_pairs_[k].first;
+                const double ts2 = image_pairs_[k].second;
+
+                const int id1 = imageIdOfTs(ts1);   // DB 的 image_id
+                const int id2 = imageIdOfTs(ts2);
+                if (id1 < 0 || id2 < 0) continue;
+
+                // 关键点容器索引
+                int idx1 = ts2idx[ts1]; // images_ids_ 的顺序下标
+                int idx2 = ts2idx[ts2];
+                if (idx1 < 0 || idx1 >= (int)all_keypoints_.size() ||
+                    idx2 < 0 || idx2 >= (int)all_keypoints_.size()) {
+                    continue;
+                }
+                const auto& kpts1 = all_keypoints_[idx1];
+                const auto& kpts2 = all_keypoints_[idx2];
+                if (kpts1.empty() || kpts2.empty()) {
+                    std::cout << "[DB] keypoints of (" << ts1 << "," << ts2 << ") is empty.\n";
+                    continue;
+                }
+
+                // pair_id 计算已保证 image_id 升序
+                const bool swapped = (id1 > id2);  // 仅用于索引方向校正
+                const uint64_t pair_id = imageIdsToPairId((uint32_t)id1, (uint32_t)id2);
+
+                sqlite3_reset(stmt);
+                sqlite3_bind_int64(stmt, 1, (sqlite3_int64)pair_id);
+                if (sqlite3_step(stmt) != SQLITE_ROW) continue;
+
+                const int rows = sqlite3_column_int(stmt, 0);
+                const int cols = sqlite3_column_int(stmt, 1); // 应为 2
+                const void* blob = sqlite3_column_blob(stmt, 2);
+                const int blob_bytes = sqlite3_column_bytes(stmt, 2);
+                if (cols != 2 || !blob || rows <= 0 ||
+                    blob_bytes != rows * 2 * (int)sizeof(uint32_t)) {
+                    continue;
+                }
+
+                const uint32_t* up = reinterpret_cast<const uint32_t*>(blob);
+                auto& vec = all_matches_[k];
+                vec.reserve(rows);
+
+                for (int r = 0; r < rows; ++r) {
+                    int i_small = (int)up[2*r + 0];  // 索引对应 "较小 image_id" 那一侧
+                    int i_large = (int)up[2*r + 1];  // 索引对应 "较大 image_id" 那一侧
+
+                    // 若当前(ts1,ts2)的 id 顺序与 pair_id 的顺序不一致，则交换
+                    int i1 = i_small;
+                    int i2 = i_large;
+                    if (swapped) std::swap(i1, i2);
+
+                    // 避免 drawMatches 越界
+                    if (i1 >= 0 && i1 < (int)kpts1.size() &&
+                        i2 >= 0 && i2 < (int)kpts2.size()) {
+                        vec.emplace_back(i1, i2);
+                    }
+                }
+            }
+        }
+        sqlite3_finalize(stmt);
+    }
+
+    sqlite3_close(db);
+    std::cout << "[DB] Loaded keypoints & inlier matches from " << dataset_io_->colmap_db_path_ << "\n";
+    return true;
+}
+
+void LvbaSystem::extractAndMatchFeaturesGPU()
+{
+    // ts -> 顺序下标映射, 保持 all_keypoints_ 的按序存储
+    std::unordered_map<double, int> ts2idx;
+    ts2idx.reserve(images_ids_.size());
+    for (int i = 0; i < (int)images_ids_.size(); ++i) ts2idx[images_ids_[i]] = i;
+
+    if ((int)all_keypoints_.size() < (int)images_ids_.size())
+        all_keypoints_.resize(images_ids_.size());
+
+    if (loadFromColmapDB()) {
+        std::cout << "[Frontend] Using existing COLMAP DB: "
+                  << dataset_io_->colmap_db_path_ << "\n";
+        return;  // 已经拿到结果，直接返回
+    }
+
+    // 初始化 SiftGPU
+    SiftGPU sift;
+    const char* argv[] = {"-fo","-1","-loweo","-w","3","-t","0.01","-e","12","-v","0"};
+    sift.ParseParam(10, const_cast<char**>(argv));
+    if (sift.CreateContextGL() != SiftGPU::SIFTGPU_FULL_SUPPORTED) {
+        std::cerr << "[SiftGPU] Not supported or context creation failed.\n";
+        return;
+    }
+
+    // 匹配器
+    SiftMatchGPU matcher;
+    matcher.VerifyContextGL();
+    // const float kRatioMax  = 1.0f;  // Lowe 比值阈值（越小越严格）0.85
+    // const float kDistMax   = 0.5f;  // 距离上限（按 SiftGPU 自己的度量，先给个中性值）
+    // const int   kUseMBM    = 1;      // mutual-best-match（双向最邻近）
+    // matcher.SetRatio(0.8f);
+
+    // 缓存：按时间戳提取一次
+    struct ImgCache {
+        std::vector<float> desc;                  // 128*N
+        std::vector<SiftGPU::SiftKeypoint> kpt;   // GPU关键点
+        std::vector<sift::Keypoint> kpt_conv;     // 你的Keypoint（至少x,y）
+    };
+    std::unordered_map<double, ImgCache> cache;
+    cache.reserve(image_pairs_.size() * 2);
+
+    auto extract_once = [&](double ts) -> bool {
+        if (cache.find(ts) != cache.end()) return true;
+
+        std::string path = getImagePath(ts);
+        cv::Mat img = cv::imread(path, cv::IMREAD_COLOR);
+        // cv::Mat img = preprocessLowTextureBGR(img0, false);
+
+        if (img.cols != image_width_ || img.rows != image_height_) 
+        {
+            cv::resize(img, img, cv::Size(img.cols * scale_, img.rows * scale_), 0, 0, cv::INTER_LINEAR);
+        }
+
+        if (img.empty()) {
+            std::cerr << "[SiftGPU] imread failed: " << path << "\n";
+            return false;
+        }
+
+        // OpenCV 为 BGR
+        if (!sift.RunSIFT(img.cols, img.rows, img.data, GL_BGR, GL_UNSIGNED_BYTE)) {
+            std::cerr << "[SiftGPU] RunSIFT failed for " << path << "\n";
+            return false;
+        }
+
+        int n = sift.GetFeatureNum();
+        ImgCache entry;
+        entry.desc.resize(128 * n);
+        entry.kpt.resize(n);
+        if (n > 0) sift.GetFeatureVector(entry.kpt.data(), entry.desc.data());
+
+        // 转成你的 Keypoint（至少 x,y）
+        entry.kpt_conv.resize(n);
+        for (int i = 0; i < n; ++i) {
+            sift::Keypoint kp{};
+            kp.x = entry.kpt[i].x;
+            kp.y = entry.kpt[i].y;
+            // 如需：kp.scale = entry.kpt[i].s; kp.orientation = entry.kpt[i].o;
+            entry.kpt_conv[i] = kp;
+        }
+
+        // 写回 all_keypoints_（按顺序下标）
+        auto it = ts2idx.find(ts);
+        if (it != ts2idx.end()) {
+            int idx = it->second;
+            if (all_keypoints_[idx].empty())
+                all_keypoints_[idx] = entry.kpt_conv;
+        }
+
+        cache.emplace(ts, std::move(entry));
+        return true;
+    };
+
+    // 遍历时间戳图像对并匹配。
+    // IMPORTANT: all_matches_[pair_idx] must stay strictly aligned with image_pairs_[pair_idx].
+    // The old pair_count-based code could become misaligned if extract_once() failed and continued.
+    all_matches_.clear();
+    all_matches_.resize(image_pairs_.size());
+    std::vector<bool> is_bad_pair(image_pairs_.size(), false);
+
+    std::cout << "[SiftGPU] Start Matching " << image_pairs_.size() << " image pairs ...\n";
+    for (size_t pair_idx = 0; pair_idx < image_pairs_.size(); ++pair_idx) {
+        const auto& pr = image_pairs_[pair_idx];
+        const double ts1 = pr.first;
+        const double ts2 = pr.second;
+
+        if (!extract_once(ts1) || !extract_once(ts2)) {
+            std::cout << "[SiftGPU] extract_once failed for pair: "
+                      << ts1 << " and " << ts2 << "\n";
+            all_matches_[pair_idx].clear();
+            is_bad_pair[pair_idx] = true;
+            printProgressBar(pair_idx + 1, image_pairs_.size());
+            continue;
+        }
+
+        auto& c1 = cache[ts1];
+        auto& c2 = cache[ts2];
+        matcher.SetDescriptors(0, (int)c1.kpt.size(), c1.desc.data());
+        matcher.SetDescriptors(1, (int)c2.kpt.size(), c2.desc.data());
+
+        std::vector<std::pair<int,int>> matches;
+        if (!c1.kpt.empty()) {
+            std::unique_ptr<int[][2]> buf(new int[c1.kpt.size()][2]);
+            const int nmatch = matcher.GetSiftMatch(
+                static_cast<int>(c1.kpt.size()), buf.get(), 0.7f, 0.8f, 1);
+            matches.reserve(nmatch);
+            for (int i = 0; i < nmatch; ++i) {
+                const int i1 = buf[i][0];
+                const int i2 = buf[i][1];
+                if (i1 >= 0 && i1 < (int)c1.kpt.size() &&
+                    i2 >= 0 && i2 < (int)c2.kpt.size()) {
+                    matches.emplace_back(i1, i2);
+                }
+            }
+        }
+
+        all_matches_[pair_idx] = matches;
+
+        // 可视化（沿用原先以“顺序下标”为文件名的函数签名）
+        auto it1 = ts2idx.find(ts1);
+        auto it2 = ts2idx.find(ts2);
+        if (it1 != ts2idx.end() && it2 != ts2idx.end()) {
+            const int id1 = it1->second;
+            const int id2 = it2->second;
+            cv::Mat img1 = cv::imread(getImagePath(ts1), cv::IMREAD_COLOR);
+            cv::Mat img2 = cv::imread(getImagePath(ts2), cv::IMREAD_COLOR);
+            drawAndSaveMatchesGPU(dataset_path_ + "result/", id1, id2,
+                                  img1, img2, c1.kpt, c2.kpt, matches);
+        }
+
+        printProgressBar(pair_idx + 1, image_pairs_.size());
+    }
+    std::cout << std::endl;
+}
+
+void LvbaSystem::generateDepthWithVoxel() 
+{
+    const CameraIntrinsics cam{fx_, fy_, cx_, cy_, d0_, d1_, d2_, d3_};
+    const size_t N = all_voxel_ids_.size();
+    if (poses_.size() != N) {
+        std::cerr << "[generateDepthWithVoxel] size mismatch: poses=" << poses_.size()
+                  << ", voxel_ids=" << N << std::endl;
+    }
+    if (!images_ids_.empty() && images_ids_.size() != N) {
+        std::cerr << "[generateDepthWithVoxel] size mismatch: images_ids=" << images_ids_.size()
+                  << ", voxel_ids=" << N << std::endl;
+    }
+
+    // std::cout << "all_voxel_ids_.size(): " << N << std::endl;
+
+    Rcw_all_.clear(); tcw_all_.clear(); Rcw_all_optimized_.clear(); tcw_all_optimized_.clear(); all_depths_.clear();
+    Rcw_all_.reserve(N); tcw_all_.reserve(N); Rcw_all_optimized_.reserve(N); tcw_all_optimized_.reserve(N); all_depths_.reserve(N);
+    
+    std::cout << "[generateDepthWithVoxel] Generating depths for " << N << " images ...\n";
+    for (size_t id = 0; id < N; ++id) 
+    {
+        const Sophus::SE3& T_W_I_opt = poses_[id];
+        const Eigen::Matrix3d Rwi_opt = T_W_I_opt.rotation_matrix();
+        const Eigen::Vector3d Pwi_opt = T_W_I_opt.translation();
+
+        Rcw_ = Rci_ * Rwi_opt.transpose();
+        tcw_ = -Rcw_ * Pwi_opt + tci_;
+        Rcw_all_optimized_.push_back(Rcw_);
+        tcw_all_optimized_.push_back(tcw_);
+
+        const Sophus::SE3& T_W_I_orig = poses_before_[id];
+        const Eigen::Matrix3d Rwi_orig = T_W_I_orig.rotation_matrix();
+        const Eigen::Vector3d Pwi_orig = T_W_I_orig.translation();
+        Eigen::Matrix3d Rcw_orig = Rci_ * Rwi_orig.transpose();
+        Eigen::Vector3d tcw_orig = -Rcw_orig * Pwi_orig + tci_;
+        Rcw_all_.push_back(Rcw_orig);
+        tcw_all_.push_back(tcw_orig);
+
+        cv::Mat depth(image_height_, image_width_, CV_32FC1, cv::Scalar(0));
+
+        const auto& voxel_ids = all_voxel_ids_[id];
+
+        for (const VOXEL_LOC& voxel_xyz : voxel_ids) 
+        {
+            VOXEL_LOC position(voxel_xyz.x, voxel_xyz.y, voxel_xyz.z);
+            auto it = grid_map_.find(position);
+            if (it == grid_map_.end()) continue;
+
+            const std::vector<Eigen::Vector3d>& points = it->second;
+
+            for (const auto& pW : points)
+            {
+                Eigen::Vector3d pC = Rcw_ * pW + tcw_;
+                
+                const double Z = pC.z();
+                if (Z < 1e-3) continue;
+
+                double uu = 0.0, vv = 0.0;
+                if (!projectCameraToPixel(cam, pC, &uu, &vv)) continue;
+
+                const int u = static_cast<int>(uu);
+                const int v = static_cast<int>(vv);
+                if (u < 0 || u >= image_width_ || v < 0 || v >= image_height_) continue;
+
+                float& d = depth.at<float>(v, u);
+                if (d == 0.f || Z < d) d = static_cast<float>(Z);
+            }
+        }
+
+        all_depths_.push_back(depth);
+        printProgressBar(all_depths_.size(), all_voxel_ids_.size());
+        
+        // 保存深度图，以时间戳命名
+        if (!images_ids_.empty()) {
+            std::ostringstream oss;
+            oss.setf(std::ios::fixed); oss << std::setprecision(6) << images_ids_[id];
+            const std::string out = dataset_path_ + "depth/" + oss.str() + ".png";
+            cv::Mat vis;
+            depth.convertTo(vis, CV_16UC1, 2000.0); // 1m -> 1000
+            cv::imwrite(out, vis);
+        }
+    }
+    std::cout << std::endl;
+
+}
+
+void LvbaSystem::BuildTracksAndFuse3D() {
+
+    const int N = static_cast<int>(all_keypoints_.size());
+    const CameraIntrinsics cam{fx_, fy_, cx_, cy_, d0_, d1_, d2_, d3_};
+    std::cout << "[BuildTracksAndFuse3D] Building visual points from " << N << " images ...\n";
+    // 初始化 obs_to_track
+    std::vector<std::vector<int>> obs_to_track(N);
+    for (int i = 0; i < N; ++i) {
+        obs_to_track[i].assign((int)all_keypoints_[i].size(), -1);
+    }
+
+    // 邻接表
+    std::vector<std::vector<std::vector<std::pair<int,int>>>> adj(N);
+    for (int i = 0; i < N; ++i) adj[i].resize(all_keypoints_[i].size());
+
+    // 构建邻接表。
+    // IMPORTANT: use image_pairs_ as the single source of pair ordering.
+    // Do not use pairIndex(i,j,N) here because image_pairs_ is now a sparse/local-window list.
+    std::unordered_map<double, int> ts2idx;
+    ts2idx.reserve(images_ids_.size());
+    for (int i = 0; i < static_cast<int>(images_ids_.size()); ++i) {
+        ts2idx[images_ids_[i]] = i;
+    }
+
+    if (all_matches_.size() != image_pairs_.size()) {
+        std::cerr << "[BuildTracksAndFuse3D] pair/match size mismatch: image_pairs="
+                  << image_pairs_.size() << " all_matches=" << all_matches_.size() << std::endl;
+    }
+
+    const size_t pair_count = std::min(image_pairs_.size(), all_matches_.size());
+    size_t graph_edges = 0;
+    size_t skipped_bad_pair_index = 0;
+
+    for (size_t pair_idx = 0; pair_idx < pair_count; ++pair_idx) {
+        const double ts1 = image_pairs_[pair_idx].first;
+        const double ts2 = image_pairs_[pair_idx].second;
+
+        const auto it1 = ts2idx.find(ts1);
+        const auto it2 = ts2idx.find(ts2);
+        if (it1 == ts2idx.end() || it2 == ts2idx.end()) {
+            ++skipped_bad_pair_index;
+            continue;
+        }
+
+        const int i = it1->second;
+        const int j = it2->second;
+        if (i < 0 || j < 0 || i >= N || j >= N || i == j) {
+            ++skipped_bad_pair_index;
+            continue;
+        }
+
+        const auto& matches_ij = all_matches_[pair_idx];
+        if (matches_ij.empty()) continue;
+
+        for (const auto& m : matches_ij) {
+            const int ki = m.first;
+            const int kj = m.second;
+            if (ki < 0 || kj < 0) continue;
+            if (ki >= static_cast<int>(all_keypoints_[i].size()) ||
+                kj >= static_cast<int>(all_keypoints_[j].size())) {
+                continue;
+            }
+
+            adj[i][ki].push_back({j, kj});
+            adj[j][kj].push_back({i, ki});
+            ++graph_edges;
+        }
+    }
+
+    // Canonicalize adjacency so BFS/component order does not depend on SiftGPU match output order.
+    // This does not change the graph topology; it only sorts neighbors and removes duplicate edges.
+    size_t graph_edges_unique_directed = 0;
+    uint64_t graph_hash = 1469598103934665603ULL;  // FNV-1a offset basis
+    auto hash_u64 = [&](uint64_t v) {
+        for (int b = 0; b < 8; ++b) {
+            graph_hash ^= (v & 0xffULL);
+            graph_hash *= 1099511628211ULL;
+            v >>= 8;
+        }
+    };
+
+    for (int gi = 0; gi < N; ++gi) {
+        for (int gk = 0; gk < static_cast<int>(adj[gi].size()); ++gk) {
+            auto& nbrs = adj[gi][gk];
+            std::sort(nbrs.begin(), nbrs.end(),
+                      [](const std::pair<int,int>& a, const std::pair<int,int>& b) {
+                          if (a.first != b.first) return a.first < b.first;
+                          return a.second < b.second;
+                      });
+            nbrs.erase(std::unique(nbrs.begin(), nbrs.end()), nbrs.end());
+            graph_edges_unique_directed += nbrs.size();
+
+            // Hash each undirected edge exactly once in canonical node order.
+            for (const auto& nb : nbrs) {
+                if (gi < nb.first || (gi == nb.first && gk < nb.second)) {
+                    hash_u64(static_cast<uint64_t>(static_cast<uint32_t>(gi)));
+                    hash_u64(static_cast<uint64_t>(static_cast<uint32_t>(gk)));
+                    hash_u64(static_cast<uint64_t>(static_cast<uint32_t>(nb.first)));
+                    hash_u64(static_cast<uint64_t>(static_cast<uint32_t>(nb.second)));
+                }
+            }
+        }
+    }
+
+    const size_t graph_edges_unique = graph_edges_unique_directed / 2;
+    std::cout << "[VisualFrontend] graph pairs=" << pair_count
+              << " match_edges=" << graph_edges
+              << " unique_edges=" << graph_edges_unique
+              << " graph_hash=0x" << std::hex << graph_hash << std::dec
+              << " skipped_pair_index=" << skipped_bad_pair_index << std::endl;
+
+    tracks_.clear();
+    tracks_.reserve(100000);
+
+    // Stage-2 experiment: isolate LiDAR-depth tracks from pure visual triangulation tracks.
+    // Keep this local to BuildTracksAndFuse3D() so lvba_system.h does not need to change.
+    bool depth_only = true;
+    bool log_dropped_tracks = false;
+    double tri_min_angle_deg = 8.0;
+    double tri_max_reproj_px = 5.0;
+    double tri_max_depth_m = 50.0;
+    nh_.param<bool>("track_fusion/depth_only", depth_only, true);
+    nh_.param<bool>("track_fusion/log_dropped_tracks", log_dropped_tracks, false);
+    nh_.param<double>("track_fusion/tri_min_angle_deg", tri_min_angle_deg, 8.0);
+    nh_.param<double>("track_fusion/tri_max_reproj_px", tri_max_reproj_px, 5.0);
+    nh_.param<double>("track_fusion/tri_max_depth_m", tri_max_depth_m, 50.0);
+    tri_min_angle_deg = std::max(0.1, tri_min_angle_deg);
+    tri_max_reproj_px = std::max(reproj_mean_thr_px_, tri_max_reproj_px);
+    tri_max_depth_m = std::max(1.0, tri_max_depth_m);
+
+    std::cout << "[TrackFusion] depth_only=" << (depth_only ? "true" : "false")
+              << " log_dropped_tracks=" << (log_dropped_tracks ? "true" : "false")
+              << " reproj_thr=" << reproj_mean_thr_px_
+              << " min_view_angle=" << min_view_angle_deg_
+              << " tri_min_angle=" << tri_min_angle_deg
+              << " tri_max_reproj=" << tri_max_reproj_px
+              << " tri_max_depth=" << tri_max_depth_m << std::endl;
+    std::cout << "[Determinism] canonical_adjacency=true sorted_selected_entries=true" << std::endl;
+
+    int num_tracked = 0;
+    int tri_candidates = 0;
+    int tri_dlt_ok = 0;
+    int tri_positive_ok = 0;
+    int tri_depth_range_ok = 0;
+    int tri_angle_ok = 0;
+    int tri_reproj_ok = 0;
+    int tri_valid = 0;
+    int tri_selected = 0;
+    int depth_selected = 0;
+    size_t dropped_small_component = 0;
+    size_t dropped_small_unique = 0;
+    size_t dropped_no_depth = 0;
+    size_t dropped_no_candidate = 0;
+    size_t dropped_invalid_fused = 0;
+    std::chrono::duration<double, std::milli> tri_time_total_ms(0.0);
+    size_t total_components = 0;
+    // BFS 建轨迹
+    for (int i = 0; i < N; ++i) {
+        for (int ki = 0; ki < (int)all_keypoints_[i].size(); ++ki) {
+            if (obs_to_track[i][ki] != -1) continue;
+
+            std::vector<std::pair<int,int>> component;
+            std::deque<std::pair<int,int>> q;
+            q.push_back({i, ki});
+            obs_to_track[i][ki] = -2;
+
+            while (!q.empty()) {
+                auto cur = q.front(); q.pop_front();
+                component.push_back(cur);
+                int ci = cur.first;
+                int ck = cur.second;
+                for (auto& nb : adj[ci][ck]) {
+                    int ni = nb.first, nk = nb.second;
+                    if (obs_to_track[ni][nk] == -1) {
+                        obs_to_track[ni][nk] = -2;
+                        q.push_back(nb);
+                    }
+                }
+            }
+            ++total_components;
+
+            if ((int)component.size() < obser_thr_) {
+                ++dropped_small_component;
+                for (auto &obs : component) obs_to_track[obs.first][obs.second] = -1;
+                continue;
+            }
+            // 先按 image 去重；视角筛选仍按原始代码风格，用候选 3D 点到相机中心的方向做。
+            std::unordered_map<int,int> unique_id;  // img_id -> component index
+            unique_id.reserve(component.size());
+            for (int comp_idx = 0; comp_idx < static_cast<int>(component.size()); ++comp_idx) {
+                const int img_id = component[comp_idx].first;
+                if (!unique_id.count(img_id)) unique_id[img_id] = comp_idx;
+            }
+
+            if ((int)unique_id.size() < obser_thr_) {
+                ++dropped_small_unique;
+                for (auto &obs : component) obs_to_track[obs.first][obs.second] = -1;
+                continue;
+            }
+            const double cos_min_view_angle = std::cos(min_view_angle_deg_ * M_PI / 180.0);
+            std::vector<int> kept_obs_ids;
+
+            bool depth_ok = false;
+            Eigen::Vector3d Xw_depth = Eigen::Vector3d::Zero();
+            double mean_reproj_depth = std::numeric_limits<double>::infinity();
+            int cnt_reproj_depth = 0;
+
+            bool tri_ok = false;
+            Eigen::Vector3d Xw_tri = Eigen::Vector3d::Zero();
+            double mean_reproj_tri = std::numeric_limits<double>::infinity();
+            int cnt_reproj_tri = 0;
+            std::vector<int> kept_obs_ids_depth;
+            std::vector<int> kept_obs_ids_tri;
+
+            // depth-fused 候选：从深度有效观测生成 3D 点。
+            std::vector<Eigen::Vector3d> points3d(component.size(), Eigen::Vector3d::Zero());
+            std::vector<int> valid_mask(component.size(), 0);
+            for (size_t t = 0; t < component.size(); ++t) {
+                int im = component[t].first;
+                int kp = component[t].second;
+                float u = all_keypoints_[im][kp].x;
+                float v = all_keypoints_[im][kp].y;
+
+                float d = -1.0f;
+                if (!fetchDepthBilinear(all_depths_[im], u, v, d, 0.001f)) continue;
+                if (d <= 0.0f) continue;
+
+                Eigen::Vector3d Xc;
+                if (!backProjectPixelDepthDistorted(cam, u, v, d, &Xc)) continue;
+                Eigen::Vector3d Xw = camToWorld(Xc, Rcw_all_optimized_[im], tcw_all_optimized_[im]);
+                points3d[t] = Xw;
+                valid_mask[t] = 1;
+            }
+
+            std::vector<int> idx_valid;
+            for (size_t t = 0; t < points3d.size(); ++t) if (valid_mask[t]) idx_valid.push_back((int)t);
+            if ((int)idx_valid.size() >= obser_thr_) {
+                Eigen::Vector3d anchor = points3d[idx_valid[0]];
+                std::vector<int> inliers;
+                inliers.reserve(idx_valid.size());
+                for (int id : idx_valid) {
+                    double dist = (points3d[id] - anchor).norm();
+                    if (dist < 0.12) inliers.push_back(id);
+                }
+
+                std::unordered_map<int,int> best_id;  // img_id -> chosen id
+                best_id.reserve(inliers.size());
+                for (int id : inliers) {
+                    int img_id = component[id].first;
+                    if (!best_id.count(img_id)) best_id[img_id] = id;
+                }
+
+                if ((int)best_id.size() >= obser_thr_) {
+                    const auto best_entries = SortedSelectedEntries(best_id);
+                    for (const auto& kv : best_entries) {
+                        Xw_depth += points3d[kv.second];
+                    }
+                    Xw_depth /= double(best_entries.size());
+
+                    std::unordered_map<int,int> kept_id_depth;  // img_id -> chosen id after view-angle filtering
+                    std::vector<Eigen::Vector3d> kept_dirs;
+                    kept_id_depth.reserve(best_id.size());
+                    kept_obs_ids_depth.reserve(best_id.size());
+                    kept_dirs.reserve(best_id.size());
+
+                    for (const auto &kv : best_entries) {
+                        const int comp_idx = kv.second;
+                        const int cam_id = kv.first;
+                        if (cam_id < 0 || cam_id >= (int)Rcw_all_optimized_.size() ||
+                            cam_id >= (int)tcw_all_optimized_.size()) {
+                            continue;
+                        }
+                        const Eigen::Matrix3d& Rcw = Rcw_all_optimized_[cam_id];
+                        const Eigen::Vector3d& tcw = tcw_all_optimized_[cam_id];
+                        const Eigen::Vector3d Cw = -Rcw.transpose() * tcw;
+
+                        Eigen::Vector3d dir = points3d[comp_idx] - Cw;
+                        const double dir_norm = dir.norm();
+                        if (dir_norm < 1e-6) continue;
+                        dir /= dir_norm;
+
+                        double min_dot = 1.0;
+                        for (const auto& d : kept_dirs) {
+                            const double dot = dir.dot(d);
+                            if (dot < min_dot) min_dot = dot;
+                        }
+                        if (kept_dirs.empty() || min_dot <= cos_min_view_angle) {
+                            kept_id_depth[cam_id] = comp_idx;
+                            kept_obs_ids_depth.push_back(comp_idx);
+                            kept_dirs.push_back(dir);
+                        }
+                    }
+
+                    if ((int)kept_obs_ids_depth.size() >= obser_thr_) {
+                        depth_ok = ComputeMeanReproj(
+                            Xw_depth, kept_id_depth, component, all_keypoints_, Rcw_all_optimized_,
+                            tcw_all_optimized_, cam, obser_thr_,
+                            mean_reproj_depth, cnt_reproj_depth);
+                        depth_ok = depth_ok && (mean_reproj_depth <= reproj_mean_thr_px_);
+                    }
+                }
+            }
+
+            // Triangulation fallback: only enabled when depth_only=false.
+            // IMPORTANT: LiDAR-depth tracks always have priority. Triangulation is used
+            // only for components that do not have an accepted depth solution.
+            if (!depth_only && !depth_ok && unique_id.size() >= 4) {
+                ++tri_candidates;
+                const auto tri_start = std::chrono::steady_clock::now();
+                Eigen::Vector3d Xw_tri_seed = Eigen::Vector3d::Zero();
+                double mean_reproj_tri_seed = std::numeric_limits<double>::infinity();
+                int cnt_reproj_tri_seed = 0;
+
+                if (TriangulateTrackDLT(
+                        unique_id, component, all_keypoints_, Rcw_all_optimized_, tcw_all_optimized_,
+                        cam, Xw_tri_seed, mean_reproj_tri_seed, cnt_reproj_tri_seed)) {
+                    ++tri_dlt_ok;
+
+                    std::unordered_map<int,int> kept_id_tri;
+                    std::vector<Eigen::Vector3d> kept_dirs;
+                    kept_id_tri.reserve(unique_id.size());
+                    kept_obs_ids_tri.reserve(unique_id.size());
+                    kept_dirs.reserve(unique_id.size());
+
+                    const auto unique_entries = SortedSelectedEntries(unique_id);
+                    for (const auto &kv : unique_entries) {
+                        const int comp_idx = kv.second;
+                        const int cam_id = kv.first;
+                        if (cam_id < 0 || cam_id >= static_cast<int>(Rcw_all_optimized_.size()) ||
+                            cam_id >= static_cast<int>(tcw_all_optimized_.size())) {
+                            continue;
+                        }
+                        const Eigen::Matrix3d& Rcw = Rcw_all_optimized_[cam_id];
+                        const Eigen::Vector3d& tcw = tcw_all_optimized_[cam_id];
+                        const Eigen::Vector3d Cw = -Rcw.transpose() * tcw;
+
+                        Eigen::Vector3d dir = Xw_tri_seed - Cw;
+                        const double dir_norm = dir.norm();
+                        if (!std::isfinite(dir_norm) || dir_norm < 1e-6) continue;
+                        dir /= dir_norm;
+
+                        double min_dot = 1.0;
+                        for (const auto& d : kept_dirs) {
+                            min_dot = std::min(min_dot, dir.dot(d));
+                        }
+                        if (kept_dirs.empty() || min_dot <= cos_min_view_angle) {
+                            kept_id_tri[cam_id] = comp_idx;
+                            kept_obs_ids_tri.push_back(comp_idx);
+                            kept_dirs.push_back(dir);
+                        }
+                    }
+
+                    if (static_cast<int>(kept_obs_ids_tri.size()) >= 4 &&
+                        TriangulateTrackDLT(
+                            kept_id_tri, component, all_keypoints_, Rcw_all_optimized_, tcw_all_optimized_,
+                            cam, Xw_tri, mean_reproj_tri, cnt_reproj_tri)) {
+
+                        const TriGeometryCheck geo = EvaluateTriangulationGeometry(
+                            Xw_tri, kept_id_tri, component, all_keypoints_,
+                            Rcw_all_optimized_, tcw_all_optimized_, cam,
+                            tri_min_angle_deg, tri_max_reproj_px, tri_max_depth_m);
+
+                        if (geo.positive_depth_ok) ++tri_positive_ok;
+                        if (geo.depth_range_ok) ++tri_depth_range_ok;
+                        if (geo.angle_ok) ++tri_angle_ok;
+
+                        // Mean reprojection remains governed by the common track threshold (3 px by default),
+                        // while tri_max_reproj_px additionally limits the worst individual observation.
+                        if (geo.reproj_ok && mean_reproj_tri <= reproj_mean_thr_px_) {
+                            ++tri_reproj_ok;
+                            ++tri_valid;
+                            tri_ok = true;
+                            mean_reproj_tri = geo.mean_reproj_px;
+                        } else {
+                            tri_ok = false;
+                            if (log_dropped_tracks) {
+                                std::cout << "[TriFilter] reject angle=" << geo.max_view_angle_deg
+                                          << "deg mean=" << geo.mean_reproj_px
+                                          << "px max=" << geo.max_reproj_px
+                                          << "px depth=[" << geo.min_depth_m << "," << geo.max_depth_m << "]m"
+                                          << std::endl;
+                            }
+                        }
+                    }
+                }
+                tri_time_total_ms += std::chrono::steady_clock::now() - tri_start;
+            }
+
+            Eigen::Vector3d Xw_fused = Eigen::Vector3d::Zero();
+            double mean_reproj = std::numeric_limits<double>::infinity();
+            int cnt_err = 0;
+            if (depth_ok) {
+                // Always preserve the mature LiDAR-depth solution when available.
+                Xw_fused = Xw_depth;
+                mean_reproj = mean_reproj_depth;
+                cnt_err = cnt_reproj_depth;
+                kept_obs_ids = kept_obs_ids_depth;
+                ++depth_selected;
+            } else if (!depth_only && tri_ok) {
+                // Pure visual triangulation is a fallback only.
+                Xw_fused = Xw_tri;
+                mean_reproj = mean_reproj_tri;
+                cnt_err = cnt_reproj_tri;
+                kept_obs_ids = kept_obs_ids_tri;
+                ++tri_selected;
+            } else {
+                if (depth_only) ++dropped_no_depth;
+                ++dropped_no_candidate;
+                const double best_reproj = std::min(mean_reproj_depth, mean_reproj_tri);
+                if (log_dropped_tracks && std::isfinite(best_reproj)) {
+                    std::cout << "[TrackFilter] drop by mean reproj=" << best_reproj
+                              << " thr=" << reproj_mean_thr_px_ << std::endl;
+                }
+                for (auto &obs : component) obs_to_track[obs.first][obs.second] = -1;
+                continue;
+            }
+
+            if (!Xw_fused.allFinite() || Xw_fused.isZero(1e-12)) {
+                ++dropped_invalid_fused;
+                for (auto &obs : component) obs_to_track[obs.first][obs.second] = -1;
+                continue;
+            }
+
+            // Eigen::Vector3d Xw_fused = Eigen::Vector3d::Zero();
+            // for (int id : kept_obs_ids) Xw_fused += points3d[id];
+            // Xw_fused /= double(kept_obs_ids.size());
+
+            // if (Xw_fused.norm() < 0.1) {
+            //     std::cout << "bad fused point: " << Xw_fused.transpose() << std::endl;
+            // }
+
+            // RMS / MAD 基于去重后的集合
+            // double sqsum = 0.0;
+            // std::vector<double> resid_in;
+            // resid_in.reserve(kept_obs_ids.size());
+            // for (int id : kept_obs_ids) {
+            //     double r = (points3d[id] - Xw_fused).norm();
+            //     resid_in.push_back(r);
+            //     sqsum += r * r;
+            // }
+            // double rms = std::sqrt(sqsum / double(resid_in.size()));
+            // double mad_in = computeMAD(resid_in);
+
+            // 写入 Track（inlier_indices 也是去重后的）
+            Track tr;
+            tr.Xw_fused = Xw_fused;
+            // tr.mad = mad_in;
+            // tr.rms = rms;
+            tr.observations = component;
+            tr.inlier_indices.reserve(kept_obs_ids.size());
+            for (int id : kept_obs_ids) tr.inlier_indices.push_back(id);
+
+            // 真正建成一个 track 再计数、再贴回 obs_to_track
+            int track_id = (int)tracks_.size();
+            tracks_.push_back(std::move(tr));
+            ++num_tracked;
+
+            for (auto &obs : component) obs_to_track[obs.first][obs.second] = track_id;
+        }
+    }
+    if (total_components > 0) {
+        const size_t kept = static_cast<size_t>(num_tracked);
+        const size_t dropped = (total_components >= kept) ? (total_components - kept) : 0;
+        const double keep_ratio = 100.0 * static_cast<double>(kept) / static_cast<double>(total_components);
+        std::cout << "[TrackFilter] kept=" << kept << " dropped=" << dropped
+                  << " total=" << total_components
+                  << " depth_selected=" << depth_selected
+                  << " tri_selected=" << tri_selected
+                  << " ratio=" << std::fixed << std::setprecision(2)
+                  << keep_ratio << "%" << std::defaultfloat << std::endl;
+        std::cout << "[TrackFilterDetail] small_component=" << dropped_small_component
+                  << " small_unique=" << dropped_small_unique
+                  << " no_depth=" << dropped_no_depth
+                  << " no_candidate=" << dropped_no_candidate
+                  << " invalid_fused=" << dropped_invalid_fused << std::endl;
+        std::cout << "[TriangulationCPU] enabled=" << (!depth_only ? "true" : "false")
+                  << " candidates=" << tri_candidates
+                  << " valid=" << tri_valid
+                  << " selected=" << tri_selected
+                  << " time_ms=" << tri_time_total_ms.count() << std::endl;
+        std::cout << "[TriFilter] candidates=" << tri_candidates
+                  << " dlt_ok=" << tri_dlt_ok
+                  << " positive_depth=" << tri_positive_ok
+                  << " depth_range=" << tri_depth_range_ok
+                  << " angle_pass=" << tri_angle_ok
+                  << " reproj_pass=" << tri_reproj_ok
+                  << " selected=" << tri_selected
+                  << " min_angle_deg=" << tri_min_angle_deg
+                  << " max_reproj_px=" << tri_max_reproj_px
+                  << " max_depth_m=" << tri_max_depth_m << std::endl;
+    }
+    tracks_before_ = tracks_;
+
+    // showTracksComparePCL();
+    // saveTrackFeaturesOnImages();
+}
+
+
+void LvbaSystem::buildGridMapFromOptimized() {
+    grid_map_.clear();
+    const auto& x_buf_full = dataset_io_->x_buf_;
+    const auto& pl_fulls_full = dataset_io_->pl_fulls_;
+
+    const size_t N = std::min(x_buf_full.size(), pl_fulls_full.size());
+    if (N == 0) {
+        ROS_WARN("buildGridMapFromOptimized: empty inputs, skip.");
+        return;
+    }
+
+    const double vox = 0.5;
+
+    size_t total_points = 0;
+    std::vector<std::set<VOXEL_LOC>> per_frame_voxels(N);
+    for (size_t i = 0; i < N; ++i) {
+        const Eigen::Matrix3d& R = x_buf_full[i].R;
+        const Eigen::Vector3d& t = x_buf_full[i].p;
+        float loc_xyz[3];
+        for (PointType& pc : pl_fulls_full[i]->points) {
+            Eigen::Vector3d pvec_orig(pc.x, pc.y, pc.z);
+            Eigen::Vector3d pvec_tran = R * pvec_orig + t;
+            for (int j = 0; j < 3; ++j) {
+                loc_xyz[j] = pvec_tran[j] / vox;
+                if (loc_xyz[j] < 0.0f) loc_xyz[j] -= 1.0f;
+            }
+            VOXEL_LOC position((int64_t)loc_xyz[0], (int64_t)loc_xyz[1], (int64_t)loc_xyz[2]);
+            grid_map_[position].push_back(pvec_tran);
+            per_frame_voxels[i].insert(VOXEL_LOC{(int64_t)loc_xyz[0], (int64_t)loc_xyz[1], (int64_t)loc_xyz[2]});
+            ++total_points;
+        }
+    }
+
+
+    const double half_w = 0.5;
+    std::vector<double> pcd_ts;
+    pcd_ts.reserve(x_buf_full.size());
+    for (const auto& kv : x_buf_full) pcd_ts.push_back(kv.t);
+
+    all_voxel_ids_.clear();
+    all_voxel_ids_.reserve(images_ids_.size());
+
+    for (const double& img_id : images_ids_) {
+        double t_img = 0.0;
+        std::string img_name_str = std::to_string(img_id);
+        if (!parseTimestampFromName(img_name_str, t_img)) {
+            std::cerr << "[buildGridMap] bad image id in images_ids_: " << img_name_str << "\n";
+            all_voxel_ids_.emplace_back();
+            continue;
+        }
+
+        const double t0 = t_img - half_w;
+        const double t1 = t_img + half_w;
+        auto itL = std::lower_bound(pcd_ts.begin(), pcd_ts.end(), t0);
+        auto itR = std::upper_bound(pcd_ts.begin(), pcd_ts.end(), t1);
+
+        std::set<VOXEL_LOC> voxels_set;
+        for (auto it = itL; it != itR; ++it) {
+            const size_t idx = static_cast<size_t>(it - pcd_ts.begin());
+            if (idx >= per_frame_voxels.size()) continue;
+            voxels_set.insert(per_frame_voxels[idx].begin(), per_frame_voxels[idx].end());
+        }
+
+        std::vector<VOXEL_LOC> one_vox;
+        one_vox.reserve(voxels_set.size());
+        for (const auto& v : voxels_set) one_vox.push_back(v);
+        all_voxel_ids_.push_back(std::move(one_vox));
+    }
+    std::cout << "[buildGridMap] built global world cloud points=" << total_points
+              << " from pcds=" << pcd_ts.size() << "\n";
+    std::cout << "[buildGridMap] voxel ids: images=" << images_ids_.size()
+              << ", merged window=±" << half_w << "s, vox_size=" << vox << "\n";
+}
+
+void LvbaSystem::saveTrackFeaturesOnImages()
+{
+    if (images_ids_.empty() || all_keypoints_.empty()) {
+        std::cerr << "[TrackFeature] skip: empty images/keypoints.\n";
+        return;
+    }
+    if (all_keypoints_.size() != images_ids_.size()) {
+        std::cerr << "[TrackFeature] size mismatch: keypoints=" << all_keypoints_.size()
+                  << " images=" << images_ids_.size() << "\n";
+        return;
+    }
+
+    std::vector<std::vector<char>> used(all_keypoints_.size());
+    for (size_t i = 0; i < all_keypoints_.size(); ++i) {
+        used[i].assign(all_keypoints_[i].size(), 0);
+    }
+
+    for (const auto& tr : tracks_) {
+        for (int idx_in_obs : tr.inlier_indices) {
+            if (idx_in_obs < 0 || idx_in_obs >= (int)tr.observations.size()) continue;
+            const auto& obs = tr.observations[idx_in_obs];
+            const int cam_id = obs.first;
+            const int kp_id = obs.second;
+            if (cam_id < 0 || cam_id >= (int)used.size()) continue;
+            if (kp_id < 0 || kp_id >= (int)used[cam_id].size()) continue;
+            used[cam_id][kp_id] = 1;
+        }
+    }
+
+    const std::string out_dir = dataset_path_ + "track_features/";
+    if (!fs::exists(out_dir)) fs::create_directories(out_dir);
+
+    size_t total_drawn = 0;
+    size_t total_sift = 0;
+    for (size_t i = 0; i < images_ids_.size(); ++i) {
+        const double img_id = images_ids_[i];
+        cv::Mat img = cv::imread(getImagePath(img_id), cv::IMREAD_COLOR);
+        if (img.empty()) {
+            std::cerr << "[TrackFeature] cannot read image: " << img_id << "\n";
+            continue;
+        }
+
+        if (img.cols != image_width_ || img.rows != image_height_) {
+            cv::resize(img, img, cv::Size(img.cols * scale_, img.rows * scale_), 0, 0, cv::INTER_LINEAR);
+        }
+
+        const auto& kpts = all_keypoints_[i];
+        for (const auto& kp : kpts) {
+            cv::circle(img, cv::Point2f(kp.x, kp.y), 2, CV_RGB(255,0,0), -1, cv::LINE_AA);
+        }
+
+        size_t count = 0;
+        for (size_t k = 0; k < used[i].size(); ++k) {
+            if (!used[i][k]) continue;
+            const auto& kp = all_keypoints_[i][k];
+            cv::circle(img, cv::Point2f(kp.x, kp.y), 2, CV_RGB(0,255,0), -1, cv::LINE_AA);
+            ++count;
+        }
+        total_drawn += count;
+        total_sift += kpts.size();
+
+        const std::string text = "sift=" + std::to_string(kpts.size()) + " track=" + std::to_string(count);
+        cv::putText(img, text, cv::Point(12, 24), cv::FONT_HERSHEY_SIMPLEX, 0.6,
+                    CV_RGB(255,255,255), 2, cv::LINE_AA);
+        cv::putText(img, text, cv::Point(12, 24), cv::FONT_HERSHEY_SIMPLEX, 0.6,
+                    CV_RGB(0,0,0), 1, cv::LINE_AA);
+
+        const std::string out_path = out_dir + std::to_string(img_id) + ".png";
+        if (!cv::imwrite(out_path, img)) {
+            std::cerr << "[TrackFeature] failed to write: " << out_path << "\n";
+        }
+
+        std::cout << "[TrackFeature] img_id=" << img_id
+                  << " sift=" << kpts.size()
+                  << " track=" << count << "\n";
+    }
+
+    std::cout << "[TrackFeature] saved images to " << out_dir
+              << " total_sift=" << total_sift
+              << " total_track=" << total_drawn << "\n";
+}
+
+
+void LvbaSystem::optimizeCameraPoses()
+{
+    // ---------------- 基本检查 ----------------
+    const int M = static_cast<int>(Rcw_all_.size());
+    if (M == 0 || (int)tcw_all_.size() != M)
+        throw std::runtime_error("optimizeCamPoses: Rcw_all_/tcw_all_ size mismatch or empty.");
+    if ((int)all_keypoints_.size() != M)
+        throw std::runtime_error("optimizeCamPoses: all_keypoints_.size() must equal #cameras.");
+    if (tracks_.empty())
+        throw std::runtime_error("optimizeCamPoses: tracks_ is empty. Run BuildTracksAndFuse3D() first.");
+
+    std::vector<int> track_ids; track_ids.reserve(tracks_.size());
+    for (int i = 0; i < (int)tracks_.size(); ++i) {
+        const auto& tr = tracks_[i];
+        if (tr.observations.size() >= obser_thr_ && !tr.Xw_fused.isZero(1e-12) && tr.Xw_fused.allFinite()) {
+            track_ids.push_back(i);
+        }
+    }
+    
+    if (track_ids.empty()) {
+        std::cerr << "[optimizeCamPoses] Warning: no usable tracks found!" << std::endl;
+        return;
+    }
+
+    const int Npts = (int)track_ids.size();
+    std::cout << "[optimizeCamPoses] usable tracks = " << Npts << ", cameras = " << M << std::endl;
+
+    const double surf_voxel_size = dataset_io_->stage2_root_voxel_size_;
+    const float surf_eigen_thr = dataset_io_->stage2_eigen_ratio_array_[0];
+
+    const auto& pl_fulls = dataset_io_->pl_fulls_;
+    const auto& x_buf_full = dataset_io_->x_buf_;
+    const int total_size = static_cast<int>(std::min(pl_fulls.size(), x_buf_full.size()));
+    if (total_size == 0) {
+        std::cerr << "[optimizeCamPoses] empty pl_fulls/x_buf, skip." << std::endl;
+        return;
+    }
+
+    std::vector<IMUST> anchor_poses;
+    std::vector<pcl::PointCloud<PointType>::Ptr> anchor_clouds;
+
+    const int window_size = dataset_io_->window_ba_size_;
+    const double anchor_leaf = dataset_io_->anchor_leaf_size_;
+
+    anchor_poses.reserve((total_size + window_size - 1) / window_size);
+    anchor_clouds.reserve((total_size + window_size - 1) / window_size);
+
+    for (int start = 0; start < total_size; start += window_size) {
+        const int end = std::min(start + window_size, total_size);
+        const int curr_win = end - start;
+        if (curr_win <= 0) break;
+
+        pcl::PointCloud<PointType>::Ptr merged(new pcl::PointCloud<PointType>());
+        const IMUST anchor_pose = x_buf_full[start];
+
+        for (int j = start; j < end; ++j) {
+            pcl::PointCloud<PointType> tmp = *pl_fulls[j];
+            IMUST rel;
+            rel.R = anchor_pose.R.transpose() * x_buf_full[j].R;
+            rel.p = anchor_pose.R.transpose() * (x_buf_full[j].p - anchor_pose.p);
+            pl_transform(tmp, rel);
+            *merged += tmp;
+        }
+
+        down_sampling_voxel2(*merged, anchor_leaf);
+        anchor_poses.push_back(anchor_pose);
+        anchor_clouds.push_back(merged);
+    }
+
+    const int anchor_size = static_cast<int>(std::min(anchor_poses.size(), anchor_clouds.size()));
+    if (anchor_size == 0) {
+        std::cerr << "[optimizeCamPoses] empty anchor_poses/anchor_clouds, skip." << std::endl;
+        return;
+    }
+
+    std::unordered_map<VOXEL_LOC, OCTO_TREE_ROOT*> surf_map;
+    for (int j = 0; j < anchor_size; ++j) {
+        cut_voxel(surf_map, *anchor_clouds[j], anchor_poses[j], j, anchor_size,
+                  surf_voxel_size, surf_eigen_thr);
+    }
+    printf("surf_map.size(): %zu\n", surf_map.size());
+    for (auto& kv : surf_map) {
+        if (kv.second != nullptr) kv.second->recut(anchor_poses);
+    }
+    printf("After recut, surf_map.size(): %zu\n", surf_map.size());
+
+    // ---------------- 初始化优化变量 ----------------
+    std::vector<std::array<double,4>> qs(M);
+    std::vector<std::array<double,3>> ts(M);
+    
+    // 初始化 Pose
+    for (int k = 0; k < M; ++k) {
+        Eigen::Quaterniond q_eig(Rcw_all_optimized_[k]); q_eig.normalize();
+        qs[k] = { q_eig.w(), q_eig.x(), q_eig.y(), q_eig.z() };
+        ts[k] = { tcw_all_optimized_[k].x(), tcw_all_optimized_[k].y(), tcw_all_optimized_[k].z() };
+    }
+    
+    // 保存 LiDAR BA 给出的相机位姿初值，作为 Visual BA 的 pose prior 与优化位移诊断基准。
+    const std::vector<std::array<double,4>> qs_ref = qs;
+    const std::vector<std::array<double,3>> ts_ref = ts;
+
+    // 初始化 Points
+    std::vector<std::array<double,3>> Xs(Npts);
+    for (int pi = 0; pi < Npts; ++pi) {
+        const auto& X = tracks_[ track_ids[pi] ].Xw_fused;
+        Xs[pi] = { X.x(), X.y(), X.z() };
+    }
+
+    // 平面缓存
+    std::vector<Eigen::Vector3d> plane_n(Npts, Eigen::Vector3d::Zero());
+    std::vector<double>          plane_d(Npts, 0.0);
+
+    // Visual BA plane association parameters.
+    // radius=0 reproduces the original exact-voxel lookup; radius=1 searches a 3x3x3
+    // neighborhood and chooses the geometrically closest valid plane.
+    int plane_search_radius_vox = 1;
+    double plane_max_dist_m = 0.08;
+    nh_.param<int>("visual_ba/plane_search_radius_vox", plane_search_radius_vox, 1);
+    nh_.param<double>("visual_ba/plane_max_dist", plane_max_dist_m, 0.08);
+    plane_search_radius_vox = std::max(0, std::min(plane_search_radius_vox, 2));
+    plane_max_dist_m = std::max(1e-4, plane_max_dist_m);
+
+    size_t plane_exact_hit = 0;
+    size_t plane_neighbor_hit = 0;
+    size_t plane_missing_voxel = 0;
+    size_t plane_no_plane_node = 0;
+    size_t plane_invalid_geometry = 0;
+    size_t plane_distance_reject = 0;
+
+    auto recompute_local_planes = [&](){
+        for (int pi = 0; pi < Npts; ++pi)
+        {
+            plane_n[pi].setZero();
+            plane_d[pi] = 0.0;
+
+            const Eigen::Vector3d X(Xs[pi][0], Xs[pi][1], Xs[pi][2]);
+            if (!X.allFinite()) {
+                ++plane_invalid_geometry;
+                continue;
+            }
+
+            int64_t base_xyz[3];
+            for (int j = 0; j < 3; ++j) {
+                double q = X[j] / surf_voxel_size;
+                // Preserve the same negative-coordinate voxel convention as the original code.
+                if (q < 0.0) q -= 1.0;
+                base_xyz[j] = static_cast<int64_t>(q);
+            }
+
+            bool any_voxel = false;
+            bool any_plane_node = false;
+            bool any_valid_geometry = false;
+            double best_abs_dist = std::numeric_limits<double>::infinity();
+            Eigen::Vector3d best_n = Eigen::Vector3d::Zero();
+            double best_d = 0.0;
+            int best_dx = 0, best_dy = 0, best_dz = 0;
+
+            for (int dx = -plane_search_radius_vox; dx <= plane_search_radius_vox; ++dx) {
+                for (int dy = -plane_search_radius_vox; dy <= plane_search_radius_vox; ++dy) {
+                    for (int dz = -plane_search_radius_vox; dz <= plane_search_radius_vox; ++dz) {
+                        VOXEL_LOC key(base_xyz[0] + dx, base_xyz[1] + dy, base_xyz[2] + dz);
+                        auto it = surf_map.find(key);
+                        if (it == surf_map.end() || it->second == nullptr) continue;
+                        any_voxel = true;
+
+                        OCTO_TREE_NODE* node = it->second->findCorrespondPoint(X);
+                        if (node == nullptr || node->octo_state != PLANE) continue;
+                        any_plane_node = true;
+
+                        if (!node->direct.allFinite() || node->direct.norm() < 1e-6 ||
+                            !node->center.allFinite()) {
+                            continue;
+                        }
+                        any_valid_geometry = true;
+
+                        Eigen::Vector3d n = node->direct;
+                        n.normalize();
+                        const double d = -n.dot(node->center);
+                        const double abs_dist = std::abs(n.dot(X) + d);
+                        if (!std::isfinite(abs_dist)) continue;
+
+                        if (abs_dist < best_abs_dist) {
+                            best_abs_dist = abs_dist;
+                            best_n = n;
+                            best_d = d;
+                            best_dx = dx; best_dy = dy; best_dz = dz;
+                        }
+                    }
+                }
+            }
+
+            if (!any_voxel) {
+                ++plane_missing_voxel;
+                continue;
+            }
+            if (!any_plane_node) {
+                ++plane_no_plane_node;
+                continue;
+            }
+            if (!any_valid_geometry || !best_n.allFinite() || best_n.isZero(1e-6)) {
+                ++plane_invalid_geometry;
+                continue;
+            }
+            if (!std::isfinite(best_abs_dist) || best_abs_dist > plane_max_dist_m) {
+                ++plane_distance_reject;
+                continue;
+            }
+
+            plane_n[pi] = best_n;
+            plane_d[pi] = best_d;
+            if (best_dx == 0 && best_dy == 0 && best_dz == 0) ++plane_exact_hit;
+            else ++plane_neighbor_hit;
+        }
+    };
+
+    // 计算平面
+    recompute_local_planes();
+    const size_t plane_valid_total = plane_exact_hit + plane_neighbor_hit;
+    std::cout << "[PlaneAssoc] radius_vox=" << plane_search_radius_vox
+              << " max_dist=" << plane_max_dist_m << "m"
+              << " valid=" << plane_valid_total << "/" << Npts
+              << " exact=" << plane_exact_hit
+              << " neighbor=" << plane_neighbor_hit
+              << " missing_voxel=" << plane_missing_voxel
+              << " no_plane=" << plane_no_plane_node
+              << " invalid_geom=" << plane_invalid_geometry
+              << " distance_reject=" << plane_distance_reject
+              << std::endl;
+    for (auto& kv : surf_map) delete kv.second;
+
+    ceres::Problem problem;
+    ceres::Solver::Options options;
+    options.max_num_iterations = 50; 
+    options.linear_solver_type = ceres::DENSE_SCHUR;
+    options.num_threads = std::max(1u, std::thread::hardware_concurrency());
+    options.minimizer_progress_to_stdout = true;
+
+    for (int k = 0; k < M; ++k) {
+        problem.AddParameterBlock(qs[k].data(), 4, new ceres::EigenQuaternionManifold());
+        problem.AddParameterBlock(ts[k].data(), 3);
+    }
+    problem.SetParameterBlockConstant(qs[0].data());
+    problem.SetParameterBlockConstant(ts[0].data());
+
+    // Robust losses were previously allocated but not actually used.
+    // Enable them explicitly for reprojection and point-plane residuals.
+    ceres::LossFunction* loss_function_reproj = new ceres::HuberLoss(1.0);
+    ceres::LossFunction* loss_function_plane  = new ceres::HuberLoss(0.1);
+
+    // LiDAR-pose prior. Defaults are intentionally conservative:
+    // translation sigma = 0.03 m, rotation sigma = 1.0 deg.
+    double pose_prior_sigma_trans_m = 0.03;
+    double pose_prior_sigma_rot_deg = 1.0;
+    double pose_guard_max_trans_m = 0.15;
+    double pose_guard_max_rot_deg = 5.0;
+    nh_.param<double>("visual_ba/pose_prior_sigma_trans", pose_prior_sigma_trans_m, 0.03);
+    nh_.param<double>("visual_ba/pose_prior_sigma_rot_deg", pose_prior_sigma_rot_deg, 1.0);
+    nh_.param<double>("visual_ba/pose_guard_max_trans", pose_guard_max_trans_m, 0.15);
+    nh_.param<double>("visual_ba/pose_guard_max_rot_deg", pose_guard_max_rot_deg, 5.0);
+
+    pose_prior_sigma_trans_m = std::max(1e-4, pose_prior_sigma_trans_m);
+    pose_prior_sigma_rot_deg = std::max(1e-3, pose_prior_sigma_rot_deg);
+    pose_guard_max_trans_m = std::max(1e-4, pose_guard_max_trans_m);
+    pose_guard_max_rot_deg = std::max(1e-3, pose_guard_max_rot_deg);
+    const double pose_prior_sigma_rot_rad = pose_prior_sigma_rot_deg * M_PI / 180.0;
+
+    int pose_prior_count = 0;
+    for (int k = 1; k < M; ++k) {
+        Eigen::Quaterniond q_ref(qs_ref[k][0], qs_ref[k][1], qs_ref[k][2], qs_ref[k][3]);
+        q_ref.normalize();
+        Eigen::Vector3d t_ref(ts_ref[k][0], ts_ref[k][1], ts_ref[k][2]);
+        ceres::CostFunction* prior_cost = CameraPosePriorError::Create(
+            q_ref, t_ref, pose_prior_sigma_rot_rad, pose_prior_sigma_trans_m);
+        problem.AddResidualBlock(prior_cost, nullptr, qs[k].data(), ts[k].data());
+        ++pose_prior_count;
+    }
+
+    std::cout << "[VisualBA] pose_prior_count=" << pose_prior_count
+              << " sigma_trans=" << pose_prior_sigma_trans_m << "m"
+              << " sigma_rot=" << pose_prior_sigma_rot_deg << "deg"
+              << " guard_trans=" << pose_guard_max_trans_m << "m"
+              << " guard_rot=" << pose_guard_max_rot_deg << "deg" << std::endl;
+
+    std::vector<bool> point_is_valid(Npts, false);
+
+    const double sigma_px = 0.5;
+    const double sigma_plane = 0.01;
+
+    for (int pi = 0; pi < Npts; ++pi) {
+        
+        const Eigen::Vector3d& n = plane_n[pi];
+        const double d = plane_d[pi];
+
+        bool has_valid_plane = (n.allFinite() && std::isfinite(d) && !n.isZero(1e-6));
+        
+        if (!has_valid_plane) {
+            point_is_valid[pi] = false; 
+            continue; 
+        }
+
+        // 只有通过了上面的筛选，才标记为有效
+        point_is_valid[pi] = true;
+
+        // 添加 Point 参数块 (因为有平面，所以添加)
+        problem.AddParameterBlock(Xs[pi].data(), 3);
+
+        // 添加 视觉重投影残差
+        const int tid = track_ids[pi];
+        const auto& tr = tracks_[tid]; 
+        std::unordered_set<int> seen;
+        for (int idx_in_obs : tr.inlier_indices) {
+            if (idx_in_obs < 0 || idx_in_obs >= (int)tr.observations.size()) continue;
+            if (!seen.insert(idx_in_obs).second) continue;
+    
+            const auto& obs = tr.observations[idx_in_obs];
+            const int cam_id = obs.first;
+            const int kp_id  = obs.second;
+            if (cam_id < 0 || cam_id >= M) continue;
+    
+            const double u = all_keypoints_[cam_id][kp_id].x;
+            const double v = all_keypoints_[cam_id][kp_id].y;
+
+            ceres::CostFunction* cost = ReprojErrorWhitenedDistorted::Create(
+                    u, v, fx_, fy_, cx_, cy_, d0_, d1_, d2_, d3_, sigma_px, sigma_px);
+            
+            problem.AddResidualBlock(cost, loss_function_reproj,
+                                     qs[cam_id].data(), ts[cam_id].data(), Xs[pi].data());
+        }
+
+        // 添加 点-面残差
+        // double r10 = (std::abs(n(0)) < 1e-12) ? 1e12 : std::abs(n(1)/n(0));
+        // double r12 = (std::abs(n(2)) < 1e-12) ? 1e12 : std::abs(n(1)/n(2));
+        // sigma_plane = (r10>10 && r12>10) ? 0.02 : 0.05; 
+        ceres::CostFunction* plane_cost = PointPlaneErrorWhitened::Create(n, d, sigma_plane);
+        problem.AddResidualBlock(plane_cost, loss_function_plane, Xs[pi].data());
+    }
+
+    ceres::Solver::Summary summary;
+    ceres::Solve(options, &problem, &summary);
+    std::cout << "[optimizeCamPoses] " << summary.BriefReport() << std::endl;
+
+    if (summary.termination_type == ceres::FAILURE || !summary.IsSolutionUsable()) {
+        std::cerr << "[optimizeCamPoses] Solver result is not usable; keep LiDAR-BA initialized poses." << std::endl;
+        return;
+    }
+
+    // Diagnose how far Visual BA tries to move cameras away from the LiDAR-BA solution.
+    double sum_trans_delta = 0.0;
+    double max_trans_delta = 0.0;
+    double sum_rot_delta_deg = 0.0;
+    double max_rot_delta_deg = 0.0;
+    int delta_count = 0;
+
+    for (int k = 0; k < M; ++k) {
+        Eigen::Quaterniond q_before(qs_ref[k][0], qs_ref[k][1], qs_ref[k][2], qs_ref[k][3]);
+        Eigen::Quaterniond q_after(qs[k][0], qs[k][1], qs[k][2], qs[k][3]);
+        q_before.normalize();
+        q_after.normalize();
+
+        Eigen::Quaterniond dq = q_before.conjugate() * q_after;
+        dq.normalize();
+        double w_abs = std::min(1.0, std::max(-1.0, std::abs(dq.w())));
+        const double rot_delta_deg = 2.0 * std::acos(w_abs) * 180.0 / M_PI;
+
+        Eigen::Vector3d t_before(ts_ref[k][0], ts_ref[k][1], ts_ref[k][2]);
+        Eigen::Vector3d t_after(ts[k][0], ts[k][1], ts[k][2]);
+        const double trans_delta = (t_after - t_before).norm();
+
+        sum_trans_delta += trans_delta;
+        max_trans_delta = std::max(max_trans_delta, trans_delta);
+        sum_rot_delta_deg += rot_delta_deg;
+        max_rot_delta_deg = std::max(max_rot_delta_deg, rot_delta_deg);
+        ++delta_count;
+    }
+
+    const double mean_trans_delta = delta_count > 0 ? sum_trans_delta / delta_count : 0.0;
+    const double mean_rot_delta_deg = delta_count > 0 ? sum_rot_delta_deg / delta_count : 0.0;
+
+    std::cout << "[VisualBA] pose_delta mean_trans=" << mean_trans_delta
+              << "m max_trans=" << max_trans_delta
+              << "m mean_rot=" << mean_rot_delta_deg
+              << "deg max_rot=" << max_rot_delta_deg << "deg" << std::endl;
+
+    const bool pose_guard_ok =
+        std::isfinite(max_trans_delta) && std::isfinite(max_rot_delta_deg) &&
+        max_trans_delta <= pose_guard_max_trans_m &&
+        max_rot_delta_deg <= pose_guard_max_rot_deg;
+
+    if (!pose_guard_ok) {
+        std::cerr << "[VisualBA] pose guard rejected solution; keep LiDAR-BA initialized camera poses."
+                  << " max_trans=" << max_trans_delta
+                  << "m max_rot=" << max_rot_delta_deg << "deg" << std::endl;
+        return;
+    }
+
+    for (int k = 0; k < M; ++k) {
+        Eigen::Quaterniond q_eig(qs[k][0], qs[k][1], qs[k][2], qs[k][3]);
+        q_eig.normalize();
+        Rcw_all_optimized_[k] = q_eig.toRotationMatrix();
+        tcw_all_optimized_[k] = Eigen::Vector3d(ts[k][0], ts[k][1], ts[k][2]);
+    }
+
+    int valid_cnt = 0;
+    for (int pi = 0; pi < Npts; ++pi) {
+        if (point_is_valid[pi]) {
+            Eigen::Vector3d X_new(Xs[pi][0], Xs[pi][1], Xs[pi][2]);
+            tracks_[ track_ids[pi] ].Xw_fused = X_new;
+            valid_cnt++;
+        } 
+    }
+    
+    std::cout << "[optimizeCamPoses] Points kept: " << valid_cnt << " / " << Npts << std::endl;
+
+    std::cout << "[optimizeCamPoses] done." << std::endl;
+}
+
+void LvbaSystem::visualizeProj() {
+
+    namespace fs = std::filesystem;
+    const CameraIntrinsics cam{fx_, fy_, cx_, cy_, d0_, d1_, d2_, d3_};
+
+    // ------- 小工具（lambda） -------
+    auto drawCross = [](cv::Mat& img, const cv::Point2d& p, int size, int thickness, const cv::Scalar& color) {
+        cv::line(img, cv::Point2d(p.x - size, p.y), cv::Point2d(p.x + size, p.y), color, thickness, cv::LINE_AA);
+        cv::line(img, cv::Point2d(p.x, p.y - size), cv::Point2d(p.x, p.y + size), color, thickness, cv::LINE_AA);
+    };
+    auto putTextShadow = [](cv::Mat& img, const std::string& text, cv::Point org, double scale=0.45, int thick=1, cv::Scalar color=CV_RGB(0,0,0)) {
+        // cv::putText(img, text, org + cv::Point(1,1), cv::FONT_HERSHEY_SIMPLEX, scale, CV_RGB(0,0,0), thick+2, cv::LINE_AA);
+        cv::putText(img, text, org, cv::FONT_HERSHEY_SIMPLEX, scale, color, thick, cv::LINE_AA);
+    };
+
+    // ------- 基本检查 -------
+    const int M = static_cast<int>(images_ids_.size());
+    if (M == 0) {
+        std::cerr << "[visualizeProj] images_ids_ is empty.\n";
+        return;
+    }
+    if (Rcw_all_.size() != (size_t)M || tcw_all_.size() != (size_t)M ||
+        Rcw_all_optimized_.size() != (size_t)M || tcw_all_optimized_.size() != (size_t)M) {
+        std::cerr << "[visualizeProj] pose arrays size mismatch with images_ids_.\n";
+        return;
+    }
+
+    // 输出目录
+    std::string out_dir = dataset_path_ + "reproj";
+    if (!fs::exists(out_dir)) fs::create_directories(out_dir);
+
+    // 是否有优化后三维点
+    bool has_after_pts = false;
+    if (this->tracks_.size() == this->tracks_before_.size() && !this->tracks_.empty()) {
+        has_after_pts = true;
+    }
+
+    // 按图像聚合条目
+    struct Item {
+        cv::Point2d uv_meas;
+        bool has_pre=false, has_post=false;
+        cv::Point2d uv_pre, uv_post;
+        double err_pre=-1, err_post=-1;
+        int track_id=-1;
+    };
+    std::vector<std::vector<Item>> per_image_items(M);
+
+    // -------- 收集：仅使用内点观测 --------
+    for (int tid = 0; tid < (int)tracks_before_.size(); ++tid) {
+        const auto& tr_b = tracks_before_[tid];
+        const auto& tr_a = tracks_[tid]; // 优化后
+
+
+        const Eigen::Vector3d Pw_pre  = tr_b.Xw_fused;
+        const Eigen::Vector3d Pw_post = tr_a.Xw_fused; // 若没有优化后三维点，则等于 pre
+
+        std::unordered_set<int> seen;
+        seen.reserve(tr_b.inlier_indices.size());
+
+        for (int idx_in_obs : tr_b.inlier_indices) {
+            if (idx_in_obs < 0 || idx_in_obs >= (int)tr_b.observations.size()) continue;
+            if (!seen.insert(idx_in_obs).second) continue;
+
+            const auto& obs = tr_b.observations[idx_in_obs];
+            const int cam_id = obs.first;
+            const int kp_id  = obs.second;
+            if (cam_id < 0 || cam_id >= M) continue;
+            if (kp_id  < 0 || kp_id >= (int)all_keypoints_[cam_id].size()) continue;
+
+            const double u_meas = all_keypoints_[cam_id][kp_id].x;
+            const double v_meas = all_keypoints_[cam_id][kp_id].y;
+            cv::Point2d uv_meas(u_meas, v_meas);
+
+            // pre
+            cv::Point2d uv_pre;
+            double u_pre = 0.0, v_pre = 0.0;
+            bool ok_pre = projectWorldToPixel(cam, Rcw_all_[cam_id], tcw_all_[cam_id],
+                                              Pw_pre, &u_pre, &v_pre);
+            uv_pre = cv::Point2d(u_pre, v_pre);
+            // post
+            cv::Point2d uv_post;
+            double u_post = 0.0, v_post = 0.0;
+            bool ok_post = projectWorldToPixel(cam, Rcw_all_optimized_[cam_id], tcw_all_optimized_[cam_id],
+                                               Pw_post, &u_post, &v_post);
+            uv_post = cv::Point2d(u_post, v_post);
+
+            Item it;
+            it.uv_meas = uv_meas;
+            it.has_pre = ok_pre;
+            it.has_post = ok_post;
+            it.uv_pre = uv_pre;
+            it.uv_post = uv_post;
+            it.err_pre  = ok_pre  ? cv::norm(uv_pre  - uv_meas) : -1.0;
+            it.err_post = ok_post ? cv::norm(uv_post - uv_meas) : -1.0;
+            it.track_id = tid;
+
+            per_image_items[cam_id].push_back(std::move(it));
+        }
+    }
+
+    // -------- 绘制并保存 --------
+    double global_err_pre = 0.0, global_err_post = 0.0;
+    int global_cnt = 0;
+    for (int k = 0; k < M; ++k) {
+        const double img_id = images_ids_[k];
+        const std::string img_path = getImagePath(img_id);
+        cv::Mat img = cv::imread(img_path, cv::IMREAD_COLOR);
+        if (img.empty()) {
+            std::cerr << "[visualizeProj] cannot read image: " << img_path << "\n";
+            continue;
+        }
+
+        double sum_pre = 0.0, sum_post = 0.0;
+        int cnt_pre = 0, cnt_post = 0;
+
+        for (const auto& it : per_image_items[k]) {
+            // 测量点：绿十字
+            drawCross(img, it.uv_meas, 5, 1, CV_RGB(0,255,0));
+
+            // pre：蓝点 + 线
+            if (it.has_pre) {
+                cv::circle(img, it.uv_pre, 2, CV_RGB(0,128,255), -1, cv::LINE_AA);
+                // cv::line(img, it.uv_pre, it.uv_meas, CV_RGB(0,128,255), 1, cv::LINE_AA);
+                sum_pre += it.err_pre; cnt_pre++;
+            }
+            // post：红点 + 线
+            if (it.has_post) {
+                cv::rectangle(img, cv::Point(it.uv_post.x-1, it.uv_post.y-1), cv::Point(it.uv_post.x+1, it.uv_post.y+1), CV_RGB(255,0,0), -1, cv::LINE_AA);
+                // cv::line(img, it.uv_post, it.uv_meas, CV_RGB(255,0,0), 1, cv::LINE_AA);
+                sum_post += it.err_post; cnt_post++;
+            }
+        }
+
+        const double mean_pre  = (cnt_pre  > 0) ? (sum_pre  / cnt_pre)  : -1.0;
+        const double mean_post = (cnt_post > 0) ? (sum_post / cnt_post) : -1.0;
+        global_cnt++; 
+        global_err_pre += mean_pre; 
+        global_err_post += mean_post;
+        // 角标信息 + 图例
+        {
+            std::ostringstream head;
+            head.setf(std::ios::fixed); head.precision(3);
+            head << "img_id=" << img_id
+                 << "  N=" << per_image_items[k].size()
+                 << "  mean_pre=" << mean_pre
+                 << "  mean_post=" << mean_post;
+            putTextShadow(img, head.str(), cv::Point(12, 24), 0.9 * scale_, 1, CV_RGB(0,0,0));
+            putTextShadow(img, "meas: green cross",      cv::Point(12, 48), 0.55 * scale_, 1, CV_RGB(0,255,0));
+            putTextShadow(img, "pre:  blue dot",  cv::Point(12, 68), 0.55 * scale_, 1, CV_RGB(0,0,255));
+            putTextShadow(img, "post: red rectangle", cv::Point(12, 88), 0.55 * scale_, 1, CV_RGB(255,0,0));
+        }
+
+        char out_name[512];
+        std::snprintf(out_name, sizeof(out_name), "%s/vis_%08.0f.png", out_dir.c_str(), img_id);
+        if (!cv::imwrite(out_name, img)) {
+            std::cerr << "[visualizeProj] failed to write: " << out_name << "\n";
+        }
+    }
+    global_err_pre /= global_cnt;
+    global_err_post /= global_cnt;
+    std::cout << "[visualizeProj] global mean pre: " << global_err_pre << "\n";
+    std::cout << "[visualizeProj] global mean post: " << global_err_post << "\n";
+
+    std::cout << "[visualizeProj] done. saved to: " << out_dir << std::endl;
+    VisualizeOptComparison(images_ids_, true);
+}
+
+void LvbaSystem::showTracksComparePCL() 
+{
+    std::cout << "[Visualizer] Preparing data..." << std::endl;
+
+    pcl::PointCloud<pcl::PointXYZ>::Ptr track_viz_before(new pcl::PointCloud<pcl::PointXYZ>());
+    pcl::PointCloud<pcl::PointXYZ>::Ptr track_viz_after (new pcl::PointCloud<pcl::PointXYZ>());
+    
+    track_viz_before->reserve(tracks_before_.size());
+    for (const auto& tr : tracks_before_) {
+        const auto& X = tr.Xw_fused;
+        if (X.allFinite()) track_viz_before->emplace_back((float)X.x(), (float)X.y(), (float)X.z());
+    }
+    
+    track_viz_after->reserve(tracks_.size());
+    for (const auto& tr : tracks_) {
+        const auto& X = tr.Xw_fused;
+        if (X.allFinite()) track_viz_after->emplace_back((float)X.x(), (float)X.y(), (float)X.z());
+    }
+
+    std::cout << "[Visualizer] Before: " << track_viz_before->size() << " | After: " << track_viz_after->size() << std::endl;
+
+    std::string target_frame_id = "map"; 
+    ros::Time current_time = ros::Time::now();
+    
+    if (track_viz_before->size() > 0) {
+        sensor_msgs::PointCloud2 msg_before;
+        pcl::toROSMsg(*track_viz_before, msg_before);
+        msg_before.header.frame_id = target_frame_id;
+        msg_before.header.stamp = current_time;
+        pub_cloud_before_.publish(msg_before);
+    }
+
+    if (track_viz_after->size() > 0) {
+        sensor_msgs::PointCloud2 msg_after;
+        pcl::toROSMsg(*track_viz_after, msg_after);
+        msg_after.header.frame_id = target_frame_id;
+        msg_after.header.stamp = current_time;
+        pub_cloud_after_.publish(msg_after);
+    }
+}
+
+void LvbaSystem::drawAndSaveMatchesGPU(
+    const std::string& out_dir,
+    int id1, int id2,
+    const cv::Mat& img1, const cv::Mat& img2,
+    const std::vector<SiftGPU::SiftKeypoint>& kpts1,
+    const std::vector<SiftGPU::SiftKeypoint>& kpts2,
+    const std::vector<std::pair<int,int>>& matches) {
+
+    namespace fs = std::filesystem;
+    fs::create_directories(out_dir);
+
+    // 拼接画布
+    int H = std::max(img1.rows, img2.rows);
+    int W = img1.cols + img2.cols;
+    cv::Mat canvas(H, W, CV_8UC3, cv::Scalar(20,20,20));
+    img1.copyTo(canvas(cv::Rect(0,0,img1.cols,img1.rows)));
+    img2.copyTo(canvas(cv::Rect(img1.cols,0,img2.cols,img2.rows)));
+
+    // 随机颜色
+    cv::RNG rng(12345);
+    auto randColor = [&](){ return cv::Scalar(rng.uniform(64,255),
+                                                rng.uniform(64,255),
+                                                rng.uniform(64,255)); };
+
+    for (auto& m : matches) {
+        int i1 = m.first, i2 = m.second;
+        if (i1<0 || i1>=(int)kpts1.size() || i2<0 || i2>=(int)kpts2.size()) continue;
+
+        cv::Point2f p1(kpts1[i1].x, kpts1[i1].y);
+        cv::Point2f p2(kpts2[i2].x + img1.cols, kpts2[i2].y);
+
+        auto col = randColor();
+        cv::circle(canvas, p1, 3, col, -1, cv::LINE_AA);
+        cv::circle(canvas, p2, 3, col, -1, cv::LINE_AA);
+        cv::line(canvas, p1, p2, col, 1, cv::LINE_AA);
+    }
+    std::cout << " Drawed : " << id1 << " - " << id2
+              << " | matches: " << matches.size() << std::endl;
+    std::string save_path = out_dir + "/" + std::to_string(id1+1) + "_" + std::to_string(id2+1) + "_matches_nums:" + std::to_string(matches.size())+".jpg";
+    cv::imwrite(save_path, canvas);
+}
+
+bool LvbaSystem::ProjectToImage(
+    const Eigen::Matrix3d& Rcw, const Eigen::Vector3d& tcw,
+    const Eigen::Vector3d& Xw,
+    double* u, double* v, double* Zc) const
+{
+    const CameraIntrinsics cam{fx_, fy_, cx_, cy_, d0_, d1_, d2_, d3_};
+    return projectWorldToPixel(cam, Rcw, tcw, Xw, u, v, Zc);
+}
+
+
+void LvbaSystem::VisualizeOptComparison(
+    const std::vector<double>& image_ids,
+    bool save_merged_pcd)
+{
+    const auto& pl_fulls = dataset_io_->pl_fulls_;
+    const auto& x_buf_opt = dataset_io_->x_buf_;
+    const auto& x_buf_bef = dataset_io_->x_buf_before_;
+
+    // -------------------------------------------------------------------------
+    // V6 dedicated 3DGS exporter.
+    // IMPORTANT: export-only path; it does not change LiDAR BA / Visual BA.
+    // Images are undistorted with DatasetIO::undistortImage(). DatasetIO builds
+    // the remap with cvK_ as BOTH source K and destination/new K, therefore the
+    // exported images keep the already-scaled pinhole intrinsics fx/fy/cx/cy.
+    // -------------------------------------------------------------------------
+    bool gs_export_enable = false;
+    std::string gs_output_dir = "3DGS_V6";
+    double gs_point_leaf_size = 0.01;
+    bool gs_save_colored_pcd = true;
+    nh_.param<bool>("gs_export/enable", gs_export_enable, false);
+    nh_.param<std::string>("gs_export/output_dir", gs_output_dir, std::string("3DGS_V6"));
+    nh_.param<double>("gs_export/point_leaf_size", gs_point_leaf_size, 0.01);
+    nh_.param<bool>("gs_export/save_colored_pcd", gs_save_colored_pcd, true);
+    gs_point_leaf_size = std::max(1e-4, gs_point_leaf_size);
+
+    std::string gs_root;
+    std::string gs_images_dir;
+    std::string gs_sparse_dir;
+    std::ofstream gs_images_file;
+    size_t gs_images_written = 0;
+
+    if (gs_export_enable) {
+        gs_root = dataset_path_ + gs_output_dir + "/";
+        gs_images_dir = gs_root + "images/";
+        gs_sparse_dir = gs_root + "sparse/0/";
+        fs::create_directories(gs_images_dir);
+        fs::create_directories(gs_sparse_dir);
+
+        // cameras.txt: exported images are already undistorted, so use PINHOLE.
+        // fx_/fy_/cx_/cy_ are DatasetIO's scaled values and match undistortImage().
+        std::ofstream cameras_file(gs_sparse_dir + "cameras.txt", std::ios::out);
+        cameras_file << "# Camera list with one line of data per camera:\n";
+        cameras_file << "#   CAMERA_ID, MODEL, WIDTH, HEIGHT, PARAMS[]\n";
+        cameras_file << "# Number of cameras: 1\n";
+        cameras_file << std::setprecision(12)
+                     << 1 << " PINHOLE "
+                     << image_width_ << " " << image_height_ << " "
+                     << fx_ << " " << fy_ << " " << cx_ << " " << cy_ << "\n";
+        cameras_file.close();
+
+        gs_images_file.open(gs_sparse_dir + "images.txt", std::ios::out);
+        gs_images_file << "# Image list with two lines of data per image:\n";
+        gs_images_file << "#   IMAGE_ID, QW, QX, QY, QZ, TX, TY, TZ, CAMERA_ID, NAME\n";
+        gs_images_file << "#   POINTS2D[] as (X, Y, POINT3D_ID)\n";
+        gs_images_file << "# Number of images: " << image_ids.size() << "\n";
+
+        // ---------------------------------------------------------------------
+        // Full-rate pose densification support files.
+        // These files are export-only diagnostics/state snapshots. They do not
+        // feed back into LiDAR BA or Visual BA.
+        // ---------------------------------------------------------------------
+        const std::string densify_dir = gs_root + "densify/";
+        fs::create_directories(densify_dir);
+
+        auto write_imust_pose = [](std::ofstream& out, const IMUST& x) {
+            Eigen::Quaterniond q(x.R);
+            q.normalize();
+            out << std::setprecision(15)
+                << x.t << " "
+                << x.p.x() << " " << x.p.y() << " " << x.p.z() << " "
+                << q.x() << " " << q.y() << " " << q.z() << " " << q.w() << "\n";
+        };
+
+        std::ofstream lidar_before_file(densify_dir + "lidar_before_twi.txt", std::ios::out);
+        std::ofstream lidar_after_file (densify_dir + "lidar_after_twi.txt",  std::ios::out);
+        lidar_before_file << "# timestamp tx ty tz qx qy qz qw\n";
+        lidar_after_file  << "# timestamp tx ty tz qx qy qz qw\n";
+        for (const auto& x : x_buf_bef) write_imust_pose(lidar_before_file, x);
+        for (const auto& x : x_buf_opt) write_imust_pose(lidar_after_file, x);
+        lidar_before_file.close();
+        lidar_after_file.close();
+
+        std::ofstream calib_file(densify_dir + "camera_calibration.txt", std::ios::out);
+        calib_file << "# Global-LVBA V6 camera model used by full-rate densifier\n";
+        calib_file << std::setprecision(15);
+        calib_file << "width " << image_width_ << "\n";
+        calib_file << "height " << image_height_ << "\n";
+        calib_file << "fx " << fx_ << "\n";
+        calib_file << "fy " << fy_ << "\n";
+        calib_file << "cx " << cx_ << "\n";
+        calib_file << "cy " << cy_ << "\n";
+        calib_file << "k1 " << d0_ << "\n";
+        calib_file << "k2 " << d1_ << "\n";
+        calib_file << "p1 " << d2_ << "\n";
+        calib_file << "p2 " << d3_ << "\n";
+        calib_file << "Rci";
+        for (int r = 0; r < 3; ++r)
+            for (int c = 0; c < 3; ++c)
+                calib_file << " " << Rci_(r,c);
+        calib_file << "\n";
+        calib_file << "tci " << tci_.x() << " " << tci_.y() << " " << tci_.z() << "\n";
+        calib_file.close();
+
+        std::ofstream kf_pre_file (densify_dir + "keyframes_pre_visual_tcw.txt",  std::ios::out);
+        std::ofstream kf_post_file(densify_dir + "keyframes_post_visual_tcw.txt", std::ios::out);
+        kf_pre_file  << "# timestamp qw qx qy qz tx ty tz\n";
+        kf_post_file << "# timestamp qw qx qy qz tx ty tz\n";
+        for (size_t k = 0; k < image_ids.size(); ++k) {
+            if (k >= poses_.size() ||
+                k >= Rcw_all_optimized_.size() || k >= tcw_all_optimized_.size()) continue;
+
+            // Pre-visual pose = LiDAR-BA initialized camera pose.
+            const Sophus::SE3& T_W_I_pre = poses_[k];
+            const Eigen::Matrix3d Rwi_pre = T_W_I_pre.rotation_matrix();
+            const Eigen::Vector3d Pwi_pre = T_W_I_pre.translation();
+            const Eigen::Matrix3d Rcw_pre = Rci_ * Rwi_pre.transpose();
+            const Eigen::Vector3d tcw_pre = -Rcw_pre * Pwi_pre + tci_;
+
+            Eigen::Quaterniond q_pre(Rcw_pre);
+            Eigen::Quaterniond q_post(Rcw_all_optimized_[k]);
+            q_pre.normalize();
+            q_post.normalize();
+
+            kf_pre_file << std::setprecision(15)
+                        << image_ids[k] << " "
+                        << q_pre.w() << " " << q_pre.x() << " " << q_pre.y() << " " << q_pre.z() << " "
+                        << tcw_pre.x() << " " << tcw_pre.y() << " " << tcw_pre.z() << "\n";
+            kf_post_file << std::setprecision(15)
+                         << image_ids[k] << " "
+                         << q_post.w() << " " << q_post.x() << " " << q_post.y() << " " << q_post.z() << " "
+                         << tcw_all_optimized_[k].x() << " "
+                         << tcw_all_optimized_[k].y() << " "
+                         << tcw_all_optimized_[k].z() << "\n";
+        }
+        kf_pre_file.close();
+        kf_post_file.close();
+
+        std::cout << "[3DGSExport] densify_support lidar=" << x_buf_opt.size()
+                  << " keyframes=" << image_ids.size()
+                  << " dir=" << densify_dir << std::endl;
+
+        std::cout << "[3DGSExport] enable=true root=" << gs_root
+                  << " images=" << image_ids.size()
+                  << " camera=PINHOLE " << image_width_ << "x" << image_height_
+                  << " K=[" << fx_ << "," << fy_ << "," << cx_ << "," << cy_ << "]"
+                  << " point_leaf=" << gs_point_leaf_size << "m" << std::endl;
+    }
+
+    pcl::PointCloud<pcl::PointXYZRGB>::Ptr merged(new pcl::PointCloud<pcl::PointXYZRGB>());
+    merged->reserve(3000000);
+    pcl::PointCloud<pcl::PointXYZRGB>::Ptr merged_b(new pcl::PointCloud<pcl::PointXYZRGB>());
+    merged_b->reserve(3000000);
+
+    if(colmap_output_enable_)
+    {
+        std::string sparse_dir = dataset_path_ + "Colmap/sparse/";
+        if (!fs::exists(sparse_dir)) fs::create_directories(sparse_dir);
+        fout_poses_after.open(sparse_dir + "images.txt", std::ios::out);
+        // fout_poses_before.open(dataset_path_ + "Colmap/before_sparse/images.txt", std::ios::out);
+    }
+    
+    for (size_t k = 0; k < image_ids.size(); ++k) {
+        const double img_id = image_ids[k];
+        const std::string img_path = getImagePath(img_id);        
+
+        // Read raw/distorted image (BGR). The colorization path below intentionally
+        // stays in the original distorted camera model used by ProjectToImage().
+        cv::Mat img = cv::imread(img_path, cv::IMREAD_COLOR);
+        if (img.empty()) {
+            std::cerr << "[Colorize] Failed to load image: " << img_path << "\n";
+            continue;
+        }
+        if (img.cols != image_width_ || img.rows != image_height_) 
+        {
+            cv::resize(img, img, cv::Size(image_width_, image_height_), 0, 0, cv::INTER_LINEAR);
+        }
+        const int W = img.cols, H = img.rows;
+
+        if (k >= Rcw_all_optimized_.size() || k >= tcw_all_optimized_.size() ||
+            k >= Rcw_all_.size() || k >= tcw_all_.size()) {
+            std::cerr << "[3DGSExport] pose index out of range k=" << k << "\n";
+            continue;
+        }
+
+        const Eigen::Matrix3d& Rcw = Rcw_all_optimized_[k];
+        const Eigen::Vector3d& tcw = tcw_all_optimized_[k];
+        const Eigen::Matrix3d& Rcw_b = Rcw_all_[k];
+        const Eigen::Vector3d& tcw_b = tcw_all_[k];
+
+        // ---------------------------------------------------------------------
+        // Dedicated 3DGS image + optimized COLMAP T_CW export.
+        // This happens independently of LiDAR colorization success, so every
+        // optimized V6 camera with a valid input image is exported.
+        // ---------------------------------------------------------------------
+        if (gs_export_enable) {
+            cv::Mat undist;
+            dataset_io_->undistortImage(img, undist);
+
+            std::ostringstream name_ss;
+            name_ss << std::setw(6) << std::setfill('0') << k << ".png";
+            const std::string image_name = name_ss.str();
+            const std::string image_out = gs_images_dir + image_name;
+
+            if (!cv::imwrite(image_out, undist)) {
+                std::cerr << "[3DGSExport] failed to write image: " << image_out << "\n";
+            } else {
+                Eigen::Quaterniond q(Rcw);
+                q.normalize();
+                const size_t colmap_image_id = k + 1;  // COLMAP IDs: positive, 1-based.
+                gs_images_file << colmap_image_id << " "
+                               << std::setprecision(12)
+                               << q.w() << " " << q.x() << " " << q.y() << " " << q.z() << " "
+                               << tcw.x() << " " << tcw.y() << " " << tcw.z() << " "
+                               << 1 << " " << image_name << "\n";
+                // A single unmatched dummy observation is accepted by COLMAP's
+                // text model and by the reference 3DGS COLMAP text loader.
+                gs_images_file << "0 0 -1\n";
+                ++gs_images_written;
+            }
+        }
+
+        //-----------------------multi-frame merged LiDAR cloud------------------//
+        pcl::PointCloud<pcl::PointXYZ>::Ptr cloud_w_all_opt(new pcl::PointCloud<pcl::PointXYZ>());
+        pcl::PointCloud<pcl::PointXYZ>::Ptr cloud_w_all_orig(new pcl::PointCloud<pcl::PointXYZ>());
+
+        for (size_t idx = 0; idx < x_buf_opt.size(); ++idx) {
+            if (std::fabs(x_buf_opt[idx].t - img_id) > 0.5) {
+                continue;
+            }
+            if (idx >= pl_fulls.size()) continue;
+            const auto& pl_body = pl_fulls[idx];
+            const IMUST& pose_opt = x_buf_opt[idx];
+            const IMUST& pose_bef = x_buf_bef[idx];
+
+            for (const auto& pb : pl_body->points) {
+                Eigen::Vector3d Xw_opt = pose_opt.R * Eigen::Vector3d(pb.x, pb.y, pb.z) + pose_opt.p;
+                cloud_w_all_opt->emplace_back(static_cast<float>(Xw_opt.x()),
+                                              static_cast<float>(Xw_opt.y()),
+                                              static_cast<float>(Xw_opt.z()));
+                Eigen::Vector3d Xw_orig = pose_bef.R * Eigen::Vector3d(pb.x, pb.y, pb.z) + pose_bef.p;
+                cloud_w_all_orig->emplace_back(static_cast<float>(Xw_orig.x()),
+                                               static_cast<float>(Xw_orig.y()),
+                                               static_cast<float>(Xw_orig.z()));
+            }
+        }
+        if (cloud_w_all_opt->empty() || cloud_w_all_orig->empty()) {
+            std::cerr << "[Colorize] skip image " << img_id << " no lidar in window\n";
+            continue;
+        }
+        
+        // Legacy COLMAP export kept untouched for compatibility.
+        Eigen::Quaterniond q(Rcw);
+        Eigen::Vector3d t = tcw;
+        Eigen::Quaterniond q_b(Rcw_b);
+        Eigen::Vector3d t_b = tcw_b;
+        
+        if(colmap_output_enable_)
+        {        
+            fout_poses_after << k << " "
+                    << std::fixed << std::setprecision(6)
+                    << q.w() << " " << q.x() << " " << q.y() << " " << q.z() << " "
+                    << t.x() << " " << t.y() << " " << t.z() << " "
+                    << 1 << " "
+                    << k << ".jpg" << std::endl;
+            fout_poses_after << "0.0 0.0 -1" << std::endl;
+
+            std::string images_dir = dataset_path_ + "Colmap/images/";
+            if (!fs::exists(images_dir)) fs::create_directories(images_dir);
+            cv::Mat undist;
+            dataset_io_->undistortImage(img, undist);
+            cv::imwrite(images_dir + std::to_string(k) + ".jpg", undist);
+        }
+
+        std::vector<float> zbuf(W * H, std::numeric_limits<float>::infinity());
+        std::vector<pcl::PointXYZRGB> pixbuf(W * H);
+        const float eps = 1e-6f;
+        
+        for (const auto& p : cloud_w_all_opt->points) {
+            Eigen::Vector3d Xw(p.x, p.y, p.z);
+        
+            double u = 0, v = 0, zc = 0;
+            if (!ProjectToImage(Rcw, tcw, Xw, &u, &v, &zc)) continue;
+        
+            int uu = static_cast<int>(std::round(u));
+            int vv = static_cast<int>(std::round(v));
+            if (uu < 0 || uu >= W || vv < 0 || vv >= H) continue;
+        
+            const int idx = vv * W + uu;
+        
+            if (zc + eps < zbuf[idx]) {
+                const cv::Vec3b bgr = img.at<cv::Vec3b>(vv, uu);
+        
+                pcl::PointXYZRGB cp;
+                cp.x = p.x; cp.y = p.y; cp.z = p.z;
+                cp.b = bgr[0]; cp.g = bgr[1]; cp.r = bgr[2];
+        
+                zbuf[idx]   = static_cast<float>(zc);
+                pixbuf[idx] = cp;
+            }
+        }
+        
+        pcl::PointCloud<pcl::PointXYZRGB>::Ptr colored(new pcl::PointCloud<pcl::PointXYZRGB>());
+        colored->reserve(W * H);
+        for (int i = 0; i < W * H; ++i) {
+            if (std::isfinite(zbuf[i])) colored->push_back(pixbuf[i]);
+        }
+
+        *merged += *colored;
+
+        std::vector<float> zbuf_b(W * H, std::numeric_limits<float>::infinity());
+        std::vector<pcl::PointXYZRGB> pixbuf_b(W * H);
+        const float eps_b = 1e-6f;
+        for (const auto& p : cloud_w_all_orig->points) {
+            Eigen::Vector3d Xw(p.x, p.y, p.z);
+
+            double u = 0, v = 0, zc = 0;
+
+            if (!ProjectToImage(Rcw_b, tcw_b, Xw, &u, &v, &zc)) continue;
+
+            int uu = static_cast<int>(std::round(u));
+            int vv = static_cast<int>(std::round(v));
+
+            if (uu < 0 || uu >= W || vv < 0 || vv >= H) continue;
+
+            const int idx = vv * W + uu;
+        
+            if (zc + eps_b < zbuf_b[idx]) {
+                const cv::Vec3b bgr = img.at<cv::Vec3b>(vv, uu);
+        
+                pcl::PointXYZRGB cp;
+                cp.x = p.x; cp.y = p.y; cp.z = p.z;
+                cp.b = bgr[0]; cp.g = bgr[1]; cp.r = bgr[2];
+        
+                zbuf_b[idx]   = static_cast<float>(zc);
+                pixbuf_b[idx] = cp;
+            }
+        }
+        pcl::PointCloud<pcl::PointXYZRGB>::Ptr colored_b(new pcl::PointCloud<pcl::PointXYZRGB>());
+        colored_b->reserve(W * H);
+        for (int i = 0; i < W * H; ++i) {
+            if (std::isfinite(zbuf_b[i])) colored_b->push_back(pixbuf_b[i]);
+        }
+        *merged_b += *colored_b;
+    }
+
+    if (gs_export_enable) {
+        if (gs_images_file.is_open()) gs_images_file.close();
+
+        pcl::PointCloud<pcl::PointXYZRGB>::Ptr gs_cloud(
+            new pcl::PointCloud<pcl::PointXYZRGB>(*merged));
+        const size_t gs_before = gs_cloud->size();
+        down_sampling_voxel2(*gs_cloud, gs_point_leaf_size);
+
+        std::ofstream points_file(gs_sparse_dir + "points3D.txt", std::ios::out);
+        points_file << "# 3D point list with one line of data per point:\n";
+        points_file << "#   POINT3D_ID, X, Y, Z, R, G, B, ERROR, TRACK[]\n";
+        points_file << "# Number of points: " << gs_cloud->size() << "\n";
+        for (size_t i = 0; i < gs_cloud->size(); ++i) {
+            const auto& point = gs_cloud->points[i];
+            points_file << (i + 1) << " "
+                        << std::setprecision(12)
+                        << point.x << " " << point.y << " " << point.z << " "
+                        << static_cast<int>(point.r) << " "
+                        << static_cast<int>(point.g) << " "
+                        << static_cast<int>(point.b) << " "
+                        << 0.0 << "\n";
+        }
+        points_file.close();
+
+        if (gs_save_colored_pcd) {
+            pcl::io::savePCDFileBinary(gs_root + "colored_lidar_v6.pcd", *gs_cloud);
+        }
+
+        std::ofstream manifest(gs_root + "README_3DGS.txt", std::ios::out);
+        manifest << "Global-LVBA V6 dedicated 3DGS dataset\n";
+        manifest << "images_written=" << gs_images_written << "\n";
+        manifest << "points_before_downsample=" << gs_before << "\n";
+        manifest << "points_after_downsample=" << gs_cloud->size() << "\n";
+        manifest << "camera_model=PINHOLE\n";
+        manifest << "width=" << image_width_ << "\nheight=" << image_height_ << "\n";
+        manifest << std::setprecision(12)
+                 << "fx=" << fx_ << "\nfy=" << fy_ << "\ncx=" << cx_ << "\ncy=" << cy_ << "\n";
+        manifest << "poses=Global-LVBA V6 optimized T_CW\n";
+        manifest << "images=DatasetIO::undistortImage output, PNG\n";
+        manifest << "points=optimized LiDAR colored cloud\n";
+        manifest.close();
+
+        std::cout << "[3DGSExport] done images=" << gs_images_written
+                  << "/" << image_ids.size()
+                  << " points=" << gs_before << "->" << gs_cloud->size()
+                  << " root=" << gs_root << std::endl;
+    }
+
+    if(colmap_output_enable_)
+    {
+        const std::string after_path = dataset_path_ + "Colmap/colored_merged_after.pcd";
+        const std::string before_path = dataset_path_ + "Colmap/colored_merged_before.pcd";
+
+        std::cout << "[Colorize] Merged colored cloud size = " << merged->size() << "\n";
+        down_sampling_voxel2(*merged, filter_size_points3D_);
+        pcl::io::savePCDFileBinary(after_path, *merged);
+        std::cout << "[Colorize] Downsampled size = " << merged->size() << "\n";
+
+        std::cout << "[Colorize] Merged colored cloud before size = " << merged_b->size() << "\n";
+        down_sampling_voxel2(*merged_b, filter_size_points3D_);
+        pcl::io::savePCDFileBinary(before_path, *merged_b);
+        std::cout << "[Colorize] Downsampled before size = " << merged_b->size() << "\n";
+
+        std::string sparse_dir = dataset_path_ + "Colmap/sparse/";
+        if (!fs::exists(sparse_dir)) fs::create_directories(sparse_dir);
+        fout_points_after.open(sparse_dir + "points3D.txt", std::ios::out);
+        for (size_t i = 0; i < merged->size(); ++i) 
+        {
+            const auto& point = merged->points[i];
+            fout_points_after << i << " "
+                        << std::fixed << std::setprecision(6)
+                        << point.x << " " << point.y << " " << point.z << " "
+                        << static_cast<int>(point.r) << " "
+                        << static_cast<int>(point.g) << " "
+                        << static_cast<int>(point.b) << " "
+                        << 0 << std::endl;
+        }
+    }
+
+    pub_cloud_b_ = merged_b;
+    pub_cloud_ = merged;
+
+    std::vector<pcl::PointCloud<PointType>::Ptr>().swap(dataset_io_->pl_fulls_);
+}
+
+std::string LvbaSystem::getImagePath(double image_id) {
+  return dataset_path_ + "all_image/" + std::to_string(image_id) + ".png";
+}
+
+std::string LvbaSystem::getPcdPath(double pcd_id) {
+  return dataset_path_ + "all_pcd_body/" + std::to_string(pcd_id) + ".pcd";
+}
+
+void LvbaSystem::pubRGBCloud() {
+
+    showTracksComparePCL();
+
+    sensor_msgs::PointCloud2 output;
+    down_sampling_voxel(*pub_cloud_, 0.01);
+    pcl::toROSMsg(*pub_cloud_, output);
+    output.header.frame_id = "map";
+    output.header.stamp = ros::Time::now();
+
+    cloud_pub_after_.publish(output);
+
+    sensor_msgs::PointCloud2 output_b;
+    down_sampling_voxel(*pub_cloud_b_, 0.01);
+    pcl::toROSMsg(*pub_cloud_b_, output_b);
+    output_b.header.frame_id = "map"; 
+    output_b.header.stamp = ros::Time::now();
+
+    cloud_pub_before_.publish(output_b);
+}
+
+
+}
