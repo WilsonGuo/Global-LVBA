@@ -609,6 +609,13 @@ void LvbaSystem::updateCameraPosesFromLidar()
     ts.reserve(lidar_opt.size());
     for (const auto& x : lidar_opt) ts.push_back(x.t);
 
+    // DIAGNOSTIC ONLY: image timestamp -> nearest LiDAR pose timestamp error.
+    // The pose selection logic below is unchanged.
+    double pose_sync_min_ms = std::numeric_limits<double>::infinity();
+    double pose_sync_max_ms = 0.0;
+    double pose_sync_sum_ms = 0.0;
+    size_t pose_sync_count = 0;
+
     for (size_t i = 0; i < images_ids_.size(); ++i) {
         double t_img = images_ids_[i];
 
@@ -623,12 +630,29 @@ void LvbaSystem::updateCameraPosesFromLidar()
             continue;
         }
 
+        const double sync_err_ms = std::abs(lidar_opt[idx].t - t_img) * 1000.0;
+        if (std::isfinite(sync_err_ms)) {
+            pose_sync_min_ms = std::min(pose_sync_min_ms, sync_err_ms);
+            pose_sync_max_ms = std::max(pose_sync_max_ms, sync_err_ms);
+            pose_sync_sum_ms += sync_err_ms;
+            ++pose_sync_count;
+        }
+
         Sophus::SE3 T_opt(lidar_opt[idx].R, lidar_opt[idx].p);
         Sophus::SE3 T_orig(lidar_orig[idx].R, lidar_orig[idx].p);
         Sophus::SE3 T_delta = T_opt * T_orig.inverse();
 
         Sophus::SE3 T_cam_new = T_delta * cam_orig[i];
         poses_.push_back(T_cam_new);
+    }
+
+    if (pose_sync_count > 0) {
+        std::cout << "[PoseSync] images=" << pose_sync_count
+                  << " nearest_lidar_dt_ms min=" << pose_sync_min_ms
+                  << " mean=" << (pose_sync_sum_ms / static_cast<double>(pose_sync_count))
+                  << " max=" << pose_sync_max_ms << std::endl;
+    } else {
+        std::cout << "[PoseSync] no valid image/LiDAR timestamp pairs" << std::endl;
     }
 }
 
@@ -1059,6 +1083,15 @@ void LvbaSystem::generateDepthWithVoxel()
     Rcw_all_.reserve(N); tcw_all_.reserve(N); Rcw_all_optimized_.reserve(N); tcw_all_optimized_.reserve(N); all_depths_.reserve(N);
     
     std::cout << "[generateDepthWithVoxel] Generating depths for " << N << " images ...\n";
+
+    // DIAGNOSTIC ONLY: depth-map construction counters.
+    size_t depth_diag_voxels_requested_total = 0;
+    size_t depth_diag_voxels_found_total = 0;
+    size_t depth_diag_world_points_total = 0;
+    size_t depth_diag_positive_z_total = 0;
+    size_t depth_diag_projected_total = 0;
+    size_t depth_diag_nonzero_pixels_total = 0;
+
     for (size_t id = 0; id < N; ++id) 
     {
         const Sophus::SE3& T_W_I_opt = poses_[id];
@@ -1082,20 +1115,28 @@ void LvbaSystem::generateDepthWithVoxel()
 
         const auto& voxel_ids = all_voxel_ids_[id];
 
+        size_t diag_voxels_found = 0;
+        size_t diag_world_points = 0;
+        size_t diag_positive_z = 0;
+        size_t diag_projected = 0;
+
         for (const VOXEL_LOC& voxel_xyz : voxel_ids) 
         {
             VOXEL_LOC position(voxel_xyz.x, voxel_xyz.y, voxel_xyz.z);
             auto it = grid_map_.find(position);
             if (it == grid_map_.end()) continue;
+            ++diag_voxels_found;
 
             const std::vector<Eigen::Vector3d>& points = it->second;
 
             for (const auto& pW : points)
             {
+                ++diag_world_points;
                 Eigen::Vector3d pC = Rcw_ * pW + tcw_;
-                
+
                 const double Z = pC.z();
                 if (Z < 1e-3) continue;
+                ++diag_positive_z;
 
                 double uu = 0.0, vv = 0.0;
                 if (!projectCameraToPixel(cam, pC, &uu, &vv)) continue;
@@ -1103,11 +1144,38 @@ void LvbaSystem::generateDepthWithVoxel()
                 const int u = static_cast<int>(uu);
                 const int v = static_cast<int>(vv);
                 if (u < 0 || u >= image_width_ || v < 0 || v >= image_height_) continue;
+                ++diag_projected;
 
                 float& d = depth.at<float>(v, u);
                 if (d == 0.f || Z < d) d = static_cast<float>(Z);
             }
         }
+
+        const int diag_nonzero_pixels = cv::countNonZero(depth);
+        const double diag_coverage_pct =
+            (image_width_ > 0 && image_height_ > 0)
+                ? 100.0 * static_cast<double>(diag_nonzero_pixels) /
+                      static_cast<double>(image_width_ * image_height_)
+                : 0.0;
+
+        depth_diag_voxels_requested_total += voxel_ids.size();
+        depth_diag_voxels_found_total += diag_voxels_found;
+        depth_diag_world_points_total += diag_world_points;
+        depth_diag_positive_z_total += diag_positive_z;
+        depth_diag_projected_total += diag_projected;
+        depth_diag_nonzero_pixels_total += static_cast<size_t>(std::max(0, diag_nonzero_pixels));
+
+        std::cout << "[DepthMap] img=" << id
+                  << " ts=" << (id < images_ids_.size() ? images_ids_[id] : -1.0)
+                  << " voxels=" << voxel_ids.size()
+                  << " voxels_found=" << diag_voxels_found
+                  << " world_points=" << diag_world_points
+                  << " positive_z=" << diag_positive_z
+                  << " projected=" << diag_projected
+                  << " nonzero_pixels=" << diag_nonzero_pixels
+                  << " coverage=" << std::fixed << std::setprecision(3)
+                  << diag_coverage_pct << "%" << std::defaultfloat
+                  << std::endl;
 
         all_depths_.push_back(depth);
         printProgressBar(all_depths_.size(), all_voxel_ids_.size());
@@ -1124,6 +1192,23 @@ void LvbaSystem::generateDepthWithVoxel()
     }
     std::cout << std::endl;
 
+    const double avg_nonzero_pixels =
+        N > 0 ? static_cast<double>(depth_diag_nonzero_pixels_total) / static_cast<double>(N) : 0.0;
+    const double avg_coverage_pct =
+        (N > 0 && image_width_ > 0 && image_height_ > 0)
+            ? 100.0 * avg_nonzero_pixels / static_cast<double>(image_width_ * image_height_)
+            : 0.0;
+    std::cout << "[DepthMapSummary] images=" << N
+              << " voxels_requested=" << depth_diag_voxels_requested_total
+              << " voxels_found=" << depth_diag_voxels_found_total
+              << " world_points=" << depth_diag_world_points_total
+              << " positive_z=" << depth_diag_positive_z_total
+              << " projected=" << depth_diag_projected_total
+              << " avg_nonzero_pixels=" << avg_nonzero_pixels
+              << " avg_coverage=" << std::fixed << std::setprecision(3)
+              << avg_coverage_pct << "%" << std::defaultfloat
+              << std::endl;
+
 }
 
 void LvbaSystem::BuildTracksAndFuse3D() {
@@ -1131,6 +1216,49 @@ void LvbaSystem::BuildTracksAndFuse3D() {
     const int N = static_cast<int>(all_keypoints_.size());
     const CameraIntrinsics cam{fx_, fy_, cx_, cy_, d0_, d1_, d2_, d3_};
     std::cout << "[BuildTracksAndFuse3D] Building visual points from " << N << " images ...\n";
+
+    // DIAGNOSTIC ONLY: how many SIFT keypoints can fetch a valid LiDAR depth.
+    size_t depth_cov_sift_total = 0;
+    size_t depth_cov_sift_with_depth_total = 0;
+    if (all_depths_.size() != all_keypoints_.size()) {
+        std::cerr << "[DepthCoverage] size mismatch: depths=" << all_depths_.size()
+                  << " keypoint_images=" << all_keypoints_.size() << std::endl;
+    }
+    const size_t depth_cov_N = std::min(all_depths_.size(), all_keypoints_.size());
+    for (size_t im = 0; im < depth_cov_N; ++im) {
+        size_t sift_with_depth = 0;
+        for (const auto& kp : all_keypoints_[im]) {
+            float d = -1.0f;
+            if (fetchDepthBilinear(all_depths_[im], kp.x, kp.y, d, 0.001f) && d > 0.0f) {
+                ++sift_with_depth;
+            }
+        }
+        depth_cov_sift_total += all_keypoints_[im].size();
+        depth_cov_sift_with_depth_total += sift_with_depth;
+        const double ratio =
+            all_keypoints_[im].empty()
+                ? 0.0
+                : 100.0 * static_cast<double>(sift_with_depth) /
+                      static_cast<double>(all_keypoints_[im].size());
+        std::cout << "[DepthCoverage] img=" << im
+                  << " ts=" << (im < images_ids_.size() ? images_ids_[im] : -1.0)
+                  << " sift=" << all_keypoints_[im].size()
+                  << " sift_with_depth=" << sift_with_depth
+                  << " ratio=" << std::fixed << std::setprecision(2)
+                  << ratio << "%" << std::defaultfloat
+                  << std::endl;
+    }
+    const double depth_cov_total_ratio =
+        depth_cov_sift_total > 0
+            ? 100.0 * static_cast<double>(depth_cov_sift_with_depth_total) /
+                  static_cast<double>(depth_cov_sift_total)
+            : 0.0;
+    std::cout << "[DepthCoverageSummary] sift=" << depth_cov_sift_total
+              << " sift_with_depth=" << depth_cov_sift_with_depth_total
+              << " ratio=" << std::fixed << std::setprecision(2)
+              << depth_cov_total_ratio << "%" << std::defaultfloat
+              << std::endl;
+
     // 初始化 obs_to_track
     std::vector<std::vector<int>> obs_to_track(N);
     for (int i = 0; i < N; ++i) {
@@ -1159,6 +1287,12 @@ void LvbaSystem::BuildTracksAndFuse3D() {
     size_t graph_edges = 0;
     size_t skipped_bad_pair_index = 0;
 
+    // DIAGNOSTIC ONLY: raw SIFT match counts grouped by image-index gap.
+    // This does not alter image_pairs_, all_matches_, or graph construction.
+    std::vector<size_t> match_pairs_by_gap(static_cast<size_t>(std::max(1, N)), 0);
+    std::vector<size_t> match_total_by_gap(static_cast<size_t>(std::max(1, N)), 0);
+    std::vector<std::vector<size_t>> match_counts_by_gap(static_cast<size_t>(std::max(1, N)));
+
     for (size_t pair_idx = 0; pair_idx < pair_count; ++pair_idx) {
         const double ts1 = image_pairs_[pair_idx].first;
         const double ts2 = image_pairs_[pair_idx].second;
@@ -1178,6 +1312,15 @@ void LvbaSystem::BuildTracksAndFuse3D() {
         }
 
         const auto& matches_ij = all_matches_[pair_idx];
+
+        // DIAGNOSTIC ONLY: pair statistics by temporal/image-index gap.
+        const int pair_gap = std::abs(j - i);
+        if (pair_gap > 0 && pair_gap < N) {
+            ++match_pairs_by_gap[static_cast<size_t>(pair_gap)];
+            match_total_by_gap[static_cast<size_t>(pair_gap)] += matches_ij.size();
+            match_counts_by_gap[static_cast<size_t>(pair_gap)].push_back(matches_ij.size());
+        }
+
         if (matches_ij.empty()) continue;
 
         for (const auto& m : matches_ij) {
@@ -1237,6 +1380,30 @@ void LvbaSystem::BuildTracksAndFuse3D() {
               << " graph_hash=0x" << std::hex << graph_hash << std::dec
               << " skipped_pair_index=" << skipped_bad_pair_index << std::endl;
 
+    // DIAGNOSTIC ONLY: inspect whether farther image pairs retain suspiciously many matches.
+    auto median_size_t = [](std::vector<size_t> values) -> double {
+        if (values.empty()) return 0.0;
+        std::sort(values.begin(), values.end());
+        const size_t n = values.size();
+        if (n & 1U) return static_cast<double>(values[n / 2]);
+        return 0.5 * (static_cast<double>(values[n / 2 - 1]) +
+                      static_cast<double>(values[n / 2]));
+    };
+    for (int gap = 1; gap < N; ++gap) {
+        const size_t pairs = match_pairs_by_gap[static_cast<size_t>(gap)];
+        if (pairs == 0) continue;
+        const size_t total_matches = match_total_by_gap[static_cast<size_t>(gap)];
+        const double mean_matches = static_cast<double>(total_matches) /
+                                    static_cast<double>(pairs);
+        std::cout << "[MatchByGap] gap=" << gap
+                  << " pairs=" << pairs
+                  << " matches=" << total_matches
+                  << " mean_per_pair=" << mean_matches
+                  << " median_per_pair="
+                  << median_size_t(match_counts_by_gap[static_cast<size_t>(gap)])
+                  << std::endl;
+    }
+
     tracks_.clear();
     tracks_.reserve(100000);
 
@@ -1275,6 +1442,66 @@ void LvbaSystem::BuildTracksAndFuse3D() {
     int tri_valid = 0;
     int tri_selected = 0;
     int depth_selected = 0;
+
+    // DIAGNOSTIC ONLY: staged counters for the LiDAR-depth track path.
+    size_t depth_components_candidate = 0;
+    size_t depth_obs_total = 0;
+    size_t depth_obs_fetch_ok = 0;
+    size_t depth_obs_backproject_ok = 0;
+    size_t depth_components_valid_ge_thr = 0;
+    size_t depth_components_cluster_ge_thr = 0;
+    size_t depth_components_unique_ge_thr = 0;
+    size_t depth_components_angle_ge_thr = 0;
+    size_t depth_components_reproj_computed = 0;
+    size_t depth_components_reproj_pass = 0;
+    double depth_reproj_sum = 0.0;
+    double depth_reproj_min = std::numeric_limits<double>::infinity();
+    double depth_reproj_max = 0.0;
+
+    // DIAGNOSTIC ONLY: post-angle-filter reprojection distributions.
+    std::vector<double> depth_reproj_values;
+    depth_reproj_values.reserve(4096);
+    std::vector<double> tri_mean_reproj_values;
+    std::vector<double> tri_max_reproj_values;
+    tri_mean_reproj_values.reserve(4096);
+    tri_max_reproj_values.reserve(4096);
+
+    // By-view-count bins: 0..7 exact, index 8 means >=8 observations.
+    std::vector<std::vector<double>> depth_reproj_by_views(9);
+    std::vector<std::vector<double>> tri_reproj_by_views(9);
+
+    // Track span (max image index - min image index), kept exact up to N-1.
+    std::vector<std::vector<double>> depth_reproj_by_span(static_cast<size_t>(std::max(1, N)));
+    std::vector<std::vector<double>> tri_reproj_by_span(static_cast<size_t>(std::max(1, N)));
+
+    auto selected_image_span = [](const std::unordered_map<int,int>& selected_ids) -> int {
+        if (selected_ids.empty()) return 0;
+        int min_img = std::numeric_limits<int>::max();
+        int max_img = std::numeric_limits<int>::min();
+        for (const auto& kv : selected_ids) {
+            min_img = std::min(min_img, kv.first);
+            max_img = std::max(max_img, kv.first);
+        }
+        return (max_img >= min_img) ? (max_img - min_img) : 0;
+    };
+
+    // DIAGNOSTIC ONLY: evaluate depth-track geometry before the 8-deg greedy angle filter.
+    std::vector<double> depth_pre_angle_reproj_values;
+    depth_pre_angle_reproj_values.reserve(4096);
+    size_t depth_pre_angle_reproj_computed = 0;
+    size_t depth_pre_angle_reproj_pass = 0;
+
+    std::vector<double> depth_max_angle_values;
+    depth_max_angle_values.reserve(4096);
+    size_t depth_angle_components = 0;
+    size_t depth_angle_kept_total = 0;
+    size_t depth_angle_kept_min = std::numeric_limits<size_t>::max();
+    size_t depth_angle_kept_max = 0;
+    size_t depth_angle_kept_1 = 0;
+    size_t depth_angle_kept_2 = 0;
+    size_t depth_angle_kept_3 = 0;
+    size_t depth_angle_kept_4plus = 0;
+
     size_t dropped_small_component = 0;
     size_t dropped_small_unique = 0;
     size_t dropped_no_depth = 0;
@@ -1282,15 +1509,23 @@ void LvbaSystem::BuildTracksAndFuse3D() {
     size_t dropped_invalid_fused = 0;
     std::chrono::duration<double, std::milli> tri_time_total_ms(0.0);
     size_t total_components = 0;
+
+    // Connected-component state for obs_to_track.
+    // -1: never visited; -2: temporarily queued/visited by current BFS;
+    // -3: permanently rejected component; >=0: accepted track id.
+    constexpr int kObsUnvisited = -1;
+    constexpr int kObsBfsVisited = -2;
+    constexpr int kObsRejected = -3;
+
     // BFS 建轨迹
     for (int i = 0; i < N; ++i) {
         for (int ki = 0; ki < (int)all_keypoints_[i].size(); ++ki) {
-            if (obs_to_track[i][ki] != -1) continue;
+            if (obs_to_track[i][ki] != kObsUnvisited) continue;
 
             std::vector<std::pair<int,int>> component;
             std::deque<std::pair<int,int>> q;
             q.push_back({i, ki});
-            obs_to_track[i][ki] = -2;
+            obs_to_track[i][ki] = kObsBfsVisited;
 
             while (!q.empty()) {
                 auto cur = q.front(); q.pop_front();
@@ -1299,17 +1534,27 @@ void LvbaSystem::BuildTracksAndFuse3D() {
                 int ck = cur.second;
                 for (auto& nb : adj[ci][ck]) {
                     int ni = nb.first, nk = nb.second;
-                    if (obs_to_track[ni][nk] == -1) {
-                        obs_to_track[ni][nk] = -2;
+                    if (obs_to_track[ni][nk] == kObsUnvisited) {
+                        obs_to_track[ni][nk] = kObsBfsVisited;
                         q.push_back(nb);
                     }
                 }
             }
+
+            // Canonicalize component order so depth anchor selection, per-image
+            // representative selection, and all diagnostics are independent of
+            // which observation happened to start the BFS.
+            std::sort(component.begin(), component.end(),
+                      [](const std::pair<int,int>& a, const std::pair<int,int>& b) {
+                          if (a.first != b.first) return a.first < b.first;
+                          return a.second < b.second;
+                      });
+
             ++total_components;
 
             if ((int)component.size() < obser_thr_) {
                 ++dropped_small_component;
-                for (auto &obs : component) obs_to_track[obs.first][obs.second] = -1;
+                for (auto &obs : component) obs_to_track[obs.first][obs.second] = kObsRejected;
                 continue;
             }
             // 先按 image 去重；视角筛选仍按原始代码风格，用候选 3D 点到相机中心的方向做。
@@ -1322,9 +1567,12 @@ void LvbaSystem::BuildTracksAndFuse3D() {
 
             if ((int)unique_id.size() < obser_thr_) {
                 ++dropped_small_unique;
-                for (auto &obs : component) obs_to_track[obs.first][obs.second] = -1;
+                for (auto &obs : component) obs_to_track[obs.first][obs.second] = kObsRejected;
                 continue;
             }
+            ++depth_components_candidate;
+            depth_obs_total += component.size();
+
             const double cos_min_view_angle = std::cos(min_view_angle_deg_ * M_PI / 180.0);
             std::vector<int> kept_obs_ids;
 
@@ -1352,9 +1600,11 @@ void LvbaSystem::BuildTracksAndFuse3D() {
                 float d = -1.0f;
                 if (!fetchDepthBilinear(all_depths_[im], u, v, d, 0.001f)) continue;
                 if (d <= 0.0f) continue;
+                ++depth_obs_fetch_ok;
 
                 Eigen::Vector3d Xc;
                 if (!backProjectPixelDepthDistorted(cam, u, v, d, &Xc)) continue;
+                ++depth_obs_backproject_ok;
                 Eigen::Vector3d Xw = camToWorld(Xc, Rcw_all_optimized_[im], tcw_all_optimized_[im]);
                 points3d[t] = Xw;
                 valid_mask[t] = 1;
@@ -1363,12 +1613,17 @@ void LvbaSystem::BuildTracksAndFuse3D() {
             std::vector<int> idx_valid;
             for (size_t t = 0; t < points3d.size(); ++t) if (valid_mask[t]) idx_valid.push_back((int)t);
             if ((int)idx_valid.size() >= obser_thr_) {
+                ++depth_components_valid_ge_thr;
                 Eigen::Vector3d anchor = points3d[idx_valid[0]];
                 std::vector<int> inliers;
                 inliers.reserve(idx_valid.size());
                 for (int id : idx_valid) {
                     double dist = (points3d[id] - anchor).norm();
                     if (dist < 0.12) inliers.push_back(id);
+                }
+
+                if ((int)inliers.size() >= obser_thr_) {
+                    ++depth_components_cluster_ge_thr;
                 }
 
                 std::unordered_map<int,int> best_id;  // img_id -> chosen id
@@ -1379,11 +1634,61 @@ void LvbaSystem::BuildTracksAndFuse3D() {
                 }
 
                 if ((int)best_id.size() >= obser_thr_) {
+                    ++depth_components_unique_ge_thr;
                     const auto best_entries = SortedSelectedEntries(best_id);
                     for (const auto& kv : best_entries) {
                         Xw_depth += points3d[kv.second];
                     }
                     Xw_depth /= double(best_entries.size());
+
+                    // DIAGNOSTIC ONLY: reprojection quality before view-angle filtering.
+                    // This uses exactly the same fused depth point and the same per-image observations,
+                    // but does not affect depth_ok or any downstream selection.
+                    double pre_angle_mean_reproj = std::numeric_limits<double>::infinity();
+                    int pre_angle_cnt_reproj = 0;
+                    if (ComputeMeanReproj(
+                            Xw_depth, best_id, component, all_keypoints_, Rcw_all_optimized_,
+                            tcw_all_optimized_, cam, obser_thr_,
+                            pre_angle_mean_reproj, pre_angle_cnt_reproj) &&
+                        std::isfinite(pre_angle_mean_reproj)) {
+                        ++depth_pre_angle_reproj_computed;
+                        depth_pre_angle_reproj_values.push_back(pre_angle_mean_reproj);
+                        if (pre_angle_mean_reproj <= reproj_mean_thr_px_) {
+                            ++depth_pre_angle_reproj_pass;
+                        }
+                    }
+
+                    // DIAGNOSTIC ONLY: maximum pairwise view angle of the depth observations
+                    // before the greedy angle filter. Use the same per-observation 3D points and
+                    // camera centers as the existing filter so the statistic explains its behavior.
+                    std::vector<Eigen::Vector3d> depth_dirs_before_angle;
+                    depth_dirs_before_angle.reserve(best_entries.size());
+                    for (const auto& kv : best_entries) {
+                        const int comp_idx = kv.second;
+                        const int cam_id = kv.first;
+                        if (cam_id < 0 || cam_id >= (int)Rcw_all_optimized_.size() ||
+                            cam_id >= (int)tcw_all_optimized_.size()) {
+                            continue;
+                        }
+                        const Eigen::Matrix3d& Rcw = Rcw_all_optimized_[cam_id];
+                        const Eigen::Vector3d& tcw = tcw_all_optimized_[cam_id];
+                        const Eigen::Vector3d Cw = -Rcw.transpose() * tcw;
+                        Eigen::Vector3d dir = points3d[comp_idx] - Cw;
+                        const double dir_norm = dir.norm();
+                        if (!std::isfinite(dir_norm) || dir_norm < 1e-6) continue;
+                        depth_dirs_before_angle.push_back(dir / dir_norm);
+                    }
+                    if (depth_dirs_before_angle.size() >= 2) {
+                        double max_angle_rad = 0.0;
+                        for (size_t a = 0; a < depth_dirs_before_angle.size(); ++a) {
+                            for (size_t b = a + 1; b < depth_dirs_before_angle.size(); ++b) {
+                                double c = depth_dirs_before_angle[a].dot(depth_dirs_before_angle[b]);
+                                c = std::max(-1.0, std::min(1.0, c));
+                                max_angle_rad = std::max(max_angle_rad, std::acos(c));
+                            }
+                        }
+                        depth_max_angle_values.push_back(max_angle_rad * 180.0 / M_PI);
+                    }
 
                     std::unordered_map<int,int> kept_id_depth;  // img_id -> chosen id after view-angle filtering
                     std::vector<Eigen::Vector3d> kept_dirs;
@@ -1419,12 +1724,40 @@ void LvbaSystem::BuildTracksAndFuse3D() {
                         }
                     }
 
+                    // DIAGNOSTIC ONLY: how many observations survive the existing greedy angle filter.
+                    ++depth_angle_components;
+                    const size_t kept_n = kept_obs_ids_depth.size();
+                    depth_angle_kept_total += kept_n;
+                    depth_angle_kept_min = std::min(depth_angle_kept_min, kept_n);
+                    depth_angle_kept_max = std::max(depth_angle_kept_max, kept_n);
+                    if (kept_n == 1) ++depth_angle_kept_1;
+                    else if (kept_n == 2) ++depth_angle_kept_2;
+                    else if (kept_n == 3) ++depth_angle_kept_3;
+                    else if (kept_n >= 4) ++depth_angle_kept_4plus;
+
                     if ((int)kept_obs_ids_depth.size() >= obser_thr_) {
-                        depth_ok = ComputeMeanReproj(
+                        ++depth_components_angle_ge_thr;
+                        const bool depth_reproj_computed = ComputeMeanReproj(
                             Xw_depth, kept_id_depth, component, all_keypoints_, Rcw_all_optimized_,
                             tcw_all_optimized_, cam, obser_thr_,
                             mean_reproj_depth, cnt_reproj_depth);
-                        depth_ok = depth_ok && (mean_reproj_depth <= reproj_mean_thr_px_);
+                        if (depth_reproj_computed && std::isfinite(mean_reproj_depth)) {
+                            ++depth_components_reproj_computed;
+                            depth_reproj_sum += mean_reproj_depth;
+                            depth_reproj_min = std::min(depth_reproj_min, mean_reproj_depth);
+                            depth_reproj_max = std::max(depth_reproj_max, mean_reproj_depth);
+                            depth_reproj_values.push_back(mean_reproj_depth);
+
+                            const size_t view_bin = std::min<size_t>(8, kept_id_depth.size());
+                            depth_reproj_by_views[view_bin].push_back(mean_reproj_depth);
+                            const int span = selected_image_span(kept_id_depth);
+                            if (span >= 0 && span < N) {
+                                depth_reproj_by_span[static_cast<size_t>(span)].push_back(mean_reproj_depth);
+                            }
+                        }
+                        depth_ok = depth_reproj_computed &&
+                                   (mean_reproj_depth <= reproj_mean_thr_px_);
+                        if (depth_ok) ++depth_components_reproj_pass;
                     }
                 }
             }
@@ -1492,6 +1825,21 @@ void LvbaSystem::BuildTracksAndFuse3D() {
                         if (geo.depth_range_ok) ++tri_depth_range_ok;
                         if (geo.angle_ok) ++tri_angle_ok;
 
+                        // DIAGNOSTIC ONLY: collect reprojection after all geometry checks up through angle.
+                        // Selection below remains unchanged.
+                        if (geo.angle_ok && std::isfinite(geo.mean_reproj_px) &&
+                            std::isfinite(geo.max_reproj_px)) {
+                            tri_mean_reproj_values.push_back(geo.mean_reproj_px);
+                            tri_max_reproj_values.push_back(geo.max_reproj_px);
+
+                            const size_t view_bin = std::min<size_t>(8, kept_id_tri.size());
+                            tri_reproj_by_views[view_bin].push_back(geo.mean_reproj_px);
+                            const int span = selected_image_span(kept_id_tri);
+                            if (span >= 0 && span < N) {
+                                tri_reproj_by_span[static_cast<size_t>(span)].push_back(geo.mean_reproj_px);
+                            }
+                        }
+
                         // Mean reprojection remains governed by the common track threshold (3 px by default),
                         // while tri_max_reproj_px additionally limits the worst individual observation.
                         if (geo.reproj_ok && mean_reproj_tri <= reproj_mean_thr_px_) {
@@ -1539,13 +1887,13 @@ void LvbaSystem::BuildTracksAndFuse3D() {
                     std::cout << "[TrackFilter] drop by mean reproj=" << best_reproj
                               << " thr=" << reproj_mean_thr_px_ << std::endl;
                 }
-                for (auto &obs : component) obs_to_track[obs.first][obs.second] = -1;
+                for (auto &obs : component) obs_to_track[obs.first][obs.second] = kObsRejected;
                 continue;
             }
 
             if (!Xw_fused.allFinite() || Xw_fused.isZero(1e-12)) {
                 ++dropped_invalid_fused;
-                for (auto &obs : component) obs_to_track[obs.first][obs.second] = -1;
+                for (auto &obs : component) obs_to_track[obs.first][obs.second] = kObsRejected;
                 continue;
             }
 
@@ -1601,6 +1949,193 @@ void LvbaSystem::BuildTracksAndFuse3D() {
                   << " no_depth=" << dropped_no_depth
                   << " no_candidate=" << dropped_no_candidate
                   << " invalid_fused=" << dropped_invalid_fused << std::endl;
+
+        const double depth_reproj_mean =
+            depth_components_reproj_computed > 0
+                ? depth_reproj_sum / static_cast<double>(depth_components_reproj_computed)
+                : std::numeric_limits<double>::infinity();
+        std::cout << "[DepthPipeline] components_candidate=" << depth_components_candidate
+                  << " obs_total=" << depth_obs_total
+                  << " obs_fetch_depth=" << depth_obs_fetch_ok
+                  << " obs_backproject=" << depth_obs_backproject_ok
+                  << " valid_ge_thr=" << depth_components_valid_ge_thr
+                  << " cluster_ge_thr=" << depth_components_cluster_ge_thr
+                  << " unique_ge_thr=" << depth_components_unique_ge_thr
+                  << " angle_ge_thr=" << depth_components_angle_ge_thr
+                  << " reproj_computed=" << depth_components_reproj_computed
+                  << " reproj_pass=" << depth_components_reproj_pass
+                  << " selected=" << depth_selected << std::endl;
+        std::cout << "[DepthReproj] computed=" << depth_components_reproj_computed
+                  << " min_px=" << depth_reproj_min
+                  << " mean_px=" << depth_reproj_mean
+                  << " max_px=" << depth_reproj_max
+                  << " threshold_px=" << reproj_mean_thr_px_ << std::endl;
+
+        // DIAGNOSTIC ONLY: summarize pre-angle reprojection and view-angle distributions.
+        auto percentile = [](std::vector<double> values, double q) -> double {
+            if (values.empty()) return std::numeric_limits<double>::infinity();
+            std::sort(values.begin(), values.end());
+            q = std::max(0.0, std::min(1.0, q));
+            const double pos = q * static_cast<double>(values.size() - 1);
+            const size_t lo = static_cast<size_t>(std::floor(pos));
+            const size_t hi = static_cast<size_t>(std::ceil(pos));
+            if (lo == hi) return values[lo];
+            const double a = pos - static_cast<double>(lo);
+            return values[lo] * (1.0 - a) + values[hi] * a;
+        };
+
+        auto count_le = [](const std::vector<double>& values, double thr) -> size_t {
+            return static_cast<size_t>(std::count_if(values.begin(), values.end(),
+                [thr](double v) { return std::isfinite(v) && v <= thr; }));
+        };
+
+        auto print_reproj_stats = [&](const char* tag, const std::vector<double>& values) {
+            double min_v = std::numeric_limits<double>::infinity();
+            double max_v = 0.0;
+            double mean_v = std::numeric_limits<double>::infinity();
+            if (!values.empty()) {
+                double sum = 0.0;
+                min_v = *std::min_element(values.begin(), values.end());
+                max_v = *std::max_element(values.begin(), values.end());
+                for (double v : values) sum += v;
+                mean_v = sum / static_cast<double>(values.size());
+            }
+            std::cout << tag
+                      << " count=" << values.size()
+                      << " min_px=" << min_v
+                      << " p10_px=" << percentile(values, 0.10)
+                      << " p25_px=" << percentile(values, 0.25)
+                      << " median_px=" << percentile(values, 0.50)
+                      << " p75_px=" << percentile(values, 0.75)
+                      << " p90_px=" << percentile(values, 0.90)
+                      << " p95_px=" << percentile(values, 0.95)
+                      << " p99_px=" << percentile(values, 0.99)
+                      << " mean_px=" << mean_v
+                      << " max_px=" << max_v
+                      << " pass1=" << count_le(values, 1.0)
+                      << " pass2=" << count_le(values, 2.0)
+                      << " pass3=" << count_le(values, 3.0)
+                      << " pass4=" << count_le(values, 4.0)
+                      << " pass5=" << count_le(values, 5.0)
+                      << " pass6=" << count_le(values, 6.0)
+                      << " pass8=" << count_le(values, 8.0)
+                      << " pass10=" << count_le(values, 10.0)
+                      << std::endl;
+        };
+
+        print_reproj_stats("[DepthReprojStats]", depth_reproj_values);
+        print_reproj_stats("[TriMeanReprojStats]", tri_mean_reproj_values);
+        print_reproj_stats("[TriMaxReprojStats]", tri_max_reproj_values);
+
+        // For triangulation, show how many angle-passed candidates would satisfy BOTH
+        // mean and worst-observation reprojection thresholds if both were set to T.
+        auto tri_pass_both = [&](double thr) -> size_t {
+            const size_t n = std::min(tri_mean_reproj_values.size(), tri_max_reproj_values.size());
+            size_t count = 0;
+            for (size_t idx = 0; idx < n; ++idx) {
+                if (tri_mean_reproj_values[idx] <= thr && tri_max_reproj_values[idx] <= thr) ++count;
+            }
+            return count;
+        };
+        std::cout << "[TriReprojThresholdSweep] count=" << tri_mean_reproj_values.size()
+                  << " pass_both_1=" << tri_pass_both(1.0)
+                  << " pass_both_2=" << tri_pass_both(2.0)
+                  << " pass_both_3=" << tri_pass_both(3.0)
+                  << " pass_both_4=" << tri_pass_both(4.0)
+                  << " pass_both_5=" << tri_pass_both(5.0)
+                  << " pass_both_6=" << tri_pass_both(6.0)
+                  << " pass_both_8=" << tri_pass_both(8.0)
+                  << " pass_both_10=" << tri_pass_both(10.0)
+                  << " current_selected=" << tri_selected
+                  << std::endl;
+
+        auto print_by_views = [&](const char* tag, const std::vector<std::vector<double>>& bins) {
+            for (size_t views = 0; views < bins.size(); ++views) {
+                const auto& vals = bins[views];
+                if (vals.empty()) continue;
+                std::cout << tag
+                          << " views=" << (views == 8 ? std::string(">=8") : std::to_string(views))
+                          << " count=" << vals.size()
+                          << " median_px=" << percentile(vals, 0.50)
+                          << " p90_px=" << percentile(vals, 0.90)
+                          << " pass3=" << count_le(vals, 3.0)
+                          << " pass5=" << count_le(vals, 5.0)
+                          << std::endl;
+            }
+        };
+        print_by_views("[DepthReprojByViews]", depth_reproj_by_views);
+        print_by_views("[TriReprojByViews]", tri_reproj_by_views);
+
+        auto print_by_span = [&](const char* tag, const std::vector<std::vector<double>>& bins) {
+            for (size_t span = 0; span < bins.size(); ++span) {
+                const auto& vals = bins[span];
+                if (vals.empty()) continue;
+                std::cout << tag
+                          << " span=" << span
+                          << " count=" << vals.size()
+                          << " median_px=" << percentile(vals, 0.50)
+                          << " p90_px=" << percentile(vals, 0.90)
+                          << " pass3=" << count_le(vals, 3.0)
+                          << " pass5=" << count_le(vals, 5.0)
+                          << std::endl;
+            }
+        };
+        print_by_span("[DepthReprojBySpan]", depth_reproj_by_span);
+        print_by_span("[TriReprojBySpan]", tri_reproj_by_span);
+
+        double pre_reproj_min = std::numeric_limits<double>::infinity();
+        double pre_reproj_mean = std::numeric_limits<double>::infinity();
+        double pre_reproj_max = 0.0;
+        if (!depth_pre_angle_reproj_values.empty()) {
+            double sum = 0.0;
+            pre_reproj_min = *std::min_element(depth_pre_angle_reproj_values.begin(),
+                                                depth_pre_angle_reproj_values.end());
+            pre_reproj_max = *std::max_element(depth_pre_angle_reproj_values.begin(),
+                                                depth_pre_angle_reproj_values.end());
+            for (double v : depth_pre_angle_reproj_values) sum += v;
+            pre_reproj_mean = sum / static_cast<double>(depth_pre_angle_reproj_values.size());
+        }
+        std::cout << "[DepthPreAngleReproj] components=" << depth_pre_angle_reproj_computed
+                  << " pass_thr=" << depth_pre_angle_reproj_pass
+                  << " threshold_px=" << reproj_mean_thr_px_
+                  << " min_px=" << pre_reproj_min
+                  << " median_px=" << percentile(depth_pre_angle_reproj_values, 0.50)
+                  << " p90_px=" << percentile(depth_pre_angle_reproj_values, 0.90)
+                  << " mean_px=" << pre_reproj_mean
+                  << " max_px=" << pre_reproj_max << std::endl;
+
+        double angle_min = std::numeric_limits<double>::infinity();
+        double angle_mean = std::numeric_limits<double>::infinity();
+        double angle_max = 0.0;
+        if (!depth_max_angle_values.empty()) {
+            double sum = 0.0;
+            angle_min = *std::min_element(depth_max_angle_values.begin(), depth_max_angle_values.end());
+            angle_max = *std::max_element(depth_max_angle_values.begin(), depth_max_angle_values.end());
+            for (double v : depth_max_angle_values) sum += v;
+            angle_mean = sum / static_cast<double>(depth_max_angle_values.size());
+        }
+        const double kept_mean = depth_angle_components > 0
+            ? static_cast<double>(depth_angle_kept_total) / static_cast<double>(depth_angle_components)
+            : 0.0;
+        const size_t kept_min_print = depth_angle_components > 0 ? depth_angle_kept_min : 0;
+        std::cout << "[DepthAngleStats] components=" << depth_angle_components
+                  << " angle_samples=" << depth_max_angle_values.size()
+                  << " threshold_deg=" << min_view_angle_deg_
+                  << " max_angle_min_deg=" << angle_min
+                  << " max_angle_median_deg=" << percentile(depth_max_angle_values, 0.50)
+                  << " max_angle_p90_deg=" << percentile(depth_max_angle_values, 0.90)
+                  << " max_angle_mean_deg=" << angle_mean
+                  << " max_angle_max_deg=" << angle_max
+                  << " kept_mean=" << kept_mean
+                  << " kept_min=" << kept_min_print
+                  << " kept_max=" << depth_angle_kept_max
+                  << " kept_1=" << depth_angle_kept_1
+                  << " kept_2=" << depth_angle_kept_2
+                  << " kept_3=" << depth_angle_kept_3
+                  << " kept_4plus=" << depth_angle_kept_4plus
+                  << " kept_ge_obser_thr=" << depth_components_angle_ge_thr
+                  << " obser_thr=" << obser_thr_ << std::endl;
+
         std::cout << "[TriangulationCPU] enabled=" << (!depth_only ? "true" : "false")
                   << " candidates=" << tri_candidates
                   << " valid=" << tri_valid
