@@ -1,94 +1,157 @@
+# 相机模型 / Camera Model
 cam_model:
-  cam_width: 720
-  cam_height: 540
+
+  # 当前使用原始分辨率 1440 × 1080
+  cam_width: 1440
+  cam_height: 1080
+
+  # 图像缩放比例
   scale: 1.0
 
-  cam_fx: 906.374156
-  cam_fy: 904.016779
-  cam_cx: 376.177026
-  cam_cy: 291.780049
+  # 相机内参
+  # 水平方向焦距，单位：pixel
+  cam_fx: 1779.324180
+  # 垂直方向焦距，单位：pixel
+  cam_fy: 1784.113127
+  # 主点 x 坐标，单位：pixel
+  cam_cx: 762.147572
+  # 主点 y 坐标，单位：pixel
+  cam_cy: 574.199517
 
-  cam_d0: -0.044706
-  cam_d1: 0.008157
-  cam_d2: 0.000200
-  cam_d3: -0.000896
+
+  # 相机畸变参数
+  cam_d0: -0.057689
+  cam_d1: 0.07207
+  cam_d2: -0.000129
+  cam_d3: 0.000116
 
 
+# 外参标定 
 extrin_calib:
+  
+  # 传感器之间的平移外参，单位：m
   extrinsic_T: [0.04165, 0.02326, -0.0284]
-  extrinsic_R: [1, 0, 0,
-                0, 1, 0,
-                0, 0, 1]
 
-  # LiDAR -> Camera
-  Rcl: [
-    -0.01296, -0.99992, -0.00005,
-    -0.01359,  0.00023, -0.99991,
-     0.99982, -0.01296, -0.01359
+  # 对应上述传感器外参的旋转矩阵
+  extrinsic_R: [
+    1, 0, 0,
+    0, 1, 0,
+    0, 0, 1
   ]
 
-  Pcl: [0.07404, -0.00242, 0.09286]
+  # LiDAR -> Camera 外参
+  Rcl: [
+    -0.01589, -0.99987,  0.00134,
+    -0.00598, -0.00125, -0.99998,
+     0.99986, -0.01589, -0.00596
+  ]
+
+  # LiDAR -> Camera 平移向量，单位：m
+  Pcl: [0.05571, -0.00276, 0.00026]
 
 
 data_config:
+
+  # Global-LVBA 输入数据根目录
   data_path: "../FAST-LIVO2-RTK/Log/GlobalLVBA/avia_test01/"
+  # COLMAP database 数据库路径
   colmap_db_path: "Colmap/colmap_sub5.db"
-
+  # 图像降采样步长
   image_sample_step: 5
-
+  # 是否启用 LiDAR BA
   enable_lidar_ba: true
+  # 是否启用视觉 BA
   enable_visual_ba: true
-
+  # 视觉图像配对的最大帧间隔
   visual_pair_max_gap: 5
 
-
 window_ba:
+
+  # 是否启用局部窗口 BA
   enable: true
+  # 局部 BA 窗口大小
   size: 20
+  # Anchor 点云体素降采样尺寸，如果你的GPU显存不够大的话，例如12GB，可以增大该值，例如0.03，避免显存爆炸
   anchor_leaf_size: 0.01
+  # 是否使用相对位姿形式的 Window BA
   use_window_ba_rel: true
 
 
+# BALM Stage 1
 BALM_stage1:
+
+  # 是否执行 Stage 1
   enable: true
+  # 根体素尺寸
   root_voxel_size: 1.0
+  # 特征值比例阈值
   eigen_ratio_array: [0.2, 0.2, 0.2, 0.2]
 
 
+# BALM Stage 2
 BALM_stage2:
+
+  # Stage 2 使用更小的 voxel：
   root_voxel_size: 0.5
+  # Stage 2 使用更严格的 eigen ratio 阈值。
   eigen_ratio_array: [0.08, 0.08, 0.08, 0.08]
 
 
+# 视觉 Track 构建、三角化与融合
 track_fusion:
+
+  # 最小观测视角
   min_view_angle: 8.0
-  reproj_mean_thr: 3.0
-
+  # Track 平均重投影误差阈值
+  reproj_mean_thr: 6.0
+  # 是否只使用深度模式
   depth_only: false
+  # 是否记录被丢弃的 track
   log_dropped_tracks: false
-
+  # 三角化最小夹角
   tri_min_angle_deg: 8.0
-  tri_max_reproj_px: 3.0
+  # 三角化最大重投影误差
+  tri_max_reproj_px: 6.0
+  # 三角化最大深度
   tri_max_depth_m: 50.0
 
 
 visual_ba:
+
+  # 位姿先验：平移标准差
   pose_prior_sigma_trans: 0.03
+  # 位姿先验：旋转标准差
   pose_prior_sigma_rot_deg: 1.0
-
+  # BA 位姿保护：最大平移改变量
   pose_guard_max_trans: 0.15
+  # BA 位姿保护：最大旋转改变量
   pose_guard_max_rot_deg: 5.0
-
+  # LiDAR 平面搜索邻域
   plane_search_radius_vox: 1
+  # 点到平面的最大距离
   plane_max_dist: 0.08
 
 
+# ============================================================
+# COLMAP 格式输出
+# ============================================================
 colmap_output:
+
+  # 是否输出优化后的 COLMAP 数据
   enable: false
+  # COLMAP points3D 点云降采样尺寸
   filter_size_points3D: 0.01
 
+
+# 3D Gaussian Splatting 数据导出
 gs_export:
+
+  # 是否启用针对 3DGS 的数据导出
   enable: true
+  # 3DGS 数据输出目录
   output_dir: "3DGS_V6"
+  # 3DGS 初始化点云降采样尺寸
   point_leaf_size: 0.01
+  # 是否保存彩色点云
   save_colored_pcd: true
+
